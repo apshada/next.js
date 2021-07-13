@@ -28,23 +28,21 @@ import {
   PRERENDER_MANIFEST,
   SERVERLESS_DIRECTORY,
   SERVER_DIRECTORY,
-} from '../next-server/lib/constants'
-import loadConfig, {
-  isTargetLikeServerless,
-  NextConfig,
-} from '../next-server/server/config'
+} from '../shared/lib/constants'
+import loadConfig, { isTargetLikeServerless } from '../server/config'
+import { NextConfigComplete } from '../server/config-shared'
 import { eventCliSession } from '../telemetry/events'
 import { hasNextSupport } from '../telemetry/ci-info'
 import { Telemetry } from '../telemetry/storage'
 import {
   normalizePagePath,
   denormalizePagePath,
-} from '../next-server/server/normalize-page-path'
+} from '../server/normalize-page-path'
 import { loadEnvConfig } from '@next/env'
 import { PrerenderManifest } from '../build'
 import exportPage from './worker'
 import { PagesManifest } from '../build/webpack/plugins/pages-manifest-plugin'
-import { getPagePath } from '../next-server/server/require'
+import { getPagePath } from '../server/require'
 import { trace } from '../telemetry/trace'
 
 const exists = promisify(existsOrig)
@@ -136,7 +134,7 @@ interface ExportOptions {
 export default async function exportApp(
   dir: string,
   options: ExportOptions,
-  configuration?: NextConfig
+  configuration?: NextConfigComplete
 ): Promise<void> {
   const nextExportSpan = trace('next-export')
 
@@ -369,6 +367,7 @@ export default async function exportApp(
       defaultLocale: i18n?.defaultLocale,
       domainLocales: i18n?.domains,
       trailingSlash: nextConfig.trailingSlash,
+      disableOptimizedLoading: nextConfig.experimental.disableOptimizedLoading,
     }
 
     const { serverRuntimeConfig, publicRuntimeConfig } = nextConfig
@@ -511,7 +510,7 @@ export default async function exportApp(
     const worker = new Worker(require.resolve('./worker'), {
       maxRetries: 0,
       numWorkers: threads,
-      enableWorkerThreads: true,
+      enableWorkerThreads: nextConfig.experimental.workerThreads,
       exposedMethods: ['default'],
     }) as Worker & { default: typeof exportPage }
 
@@ -541,6 +540,8 @@ export default async function exportApp(
             optimizeFonts: nextConfig.optimizeFonts,
             optimizeImages: nextConfig.experimental.optimizeImages,
             optimizeCss: nextConfig.experimental.optimizeCss,
+            disableOptimizedLoading:
+              nextConfig.experimental.disableOptimizedLoading,
             parentSpanId: pageExportSpan.id,
           })
 

@@ -1,25 +1,25 @@
 import url from 'url'
 import { extname, join, dirname, sep } from 'path'
-import { renderToHTML } from '../next-server/server/render'
+import { renderToHTML } from '../server/render'
 import { promises } from 'fs'
 import AmpHtmlValidator from 'next/dist/compiled/amphtml-validator'
-import { loadComponents } from '../next-server/server/load-components'
-import { isDynamicRoute } from '../next-server/lib/router/utils/is-dynamic'
-import { getRouteMatcher } from '../next-server/lib/router/utils/route-matcher'
-import { getRouteRegex } from '../next-server/lib/router/utils/route-regex'
-import { normalizePagePath } from '../next-server/server/normalize-page-path'
+import { loadComponents } from '../server/load-components'
+import { isDynamicRoute } from '../shared/lib/router/utils/is-dynamic'
+import { getRouteMatcher } from '../shared/lib/router/utils/route-matcher'
+import { getRouteRegex } from '../shared/lib/router/utils/route-regex'
+import { normalizePagePath } from '../server/normalize-page-path'
 import { SERVER_PROPS_EXPORT_ERROR } from '../lib/constants'
-import 'next/dist/next-server/server/node-polyfill-fetch'
+import '../server/node-polyfill-fetch'
 import { IncomingMessage, ServerResponse } from 'http'
 import { ComponentType } from 'react'
 import { GetStaticProps } from '../types'
-import { requireFontManifest } from '../next-server/server/require'
-import { FontManifest } from '../next-server/server/font-utils'
-import { normalizeLocalePath } from '../next-server/lib/i18n/normalize-locale-path'
+import { requireFontManifest } from '../server/require'
+import { FontManifest } from '../server/font-utils'
+import { normalizeLocalePath } from '../shared/lib/i18n/normalize-locale-path'
 import { trace } from '../telemetry/trace'
-import { isInAmpMode } from '../next-server/lib/amp'
+import { isInAmpMode } from '../shared/lib/amp'
 
-const envConfig = require('../next-server/lib/runtime-config')
+const envConfig = require('../shared/lib/runtime-config')
 
 ;(global as any).__NEXT_DATA__ = {
   nextExport: true,
@@ -50,8 +50,9 @@ interface ExportPageInput {
   subFolders?: boolean
   serverless: boolean
   optimizeFonts: boolean
-  optimizeImages: boolean
+  optimizeImages?: boolean
   optimizeCss: any
+  disableOptimizedLoading: any
   parentSpanId: any
 }
 
@@ -70,6 +71,7 @@ interface RenderOpts {
   ampSkipValidation?: boolean
   optimizeFonts?: boolean
   optimizeImages?: boolean
+  disableOptimizedLoading?: boolean
   optimizeCss?: any
   fontManifest?: FontManifest
   locales?: string[]
@@ -98,6 +100,7 @@ export default async function exportPage({
   optimizeFonts,
   optimizeImages,
   optimizeCss,
+  disableOptimizedLoading,
 }: ExportPageInput): Promise<ExportPageResults> {
   const exportPageSpan = trace('export-page-worker', parentSpanId)
 
@@ -284,6 +287,7 @@ export default async function exportPage({
               optimizeImages,
               /// @ts-ignore
               optimizeCss,
+              disableOptimizedLoading,
               distDir,
               fontManifest: optimizeFonts
                 ? requireFontManifest(distDir, serverless)
@@ -357,6 +361,7 @@ export default async function exportPage({
             optimizeFonts,
             optimizeImages,
             optimizeCss,
+            disableOptimizedLoading,
             fontManifest: optimizeFonts
               ? requireFontManifest(distDir, serverless)
               : null,
