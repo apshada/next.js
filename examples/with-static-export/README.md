@@ -4,11 +4,9 @@ Next.js enables starting as a static site or Single-Page Application (SPA), then
 
 When running `next build`, Next.js generates an HTML file per route. By breaking a strict SPA into individual HTML files, Next.js can avoid loading unnecessary JavaScript code on the client-side, reducing the bundle size and enabling faster page loads.
 
-Learn more: https://beta.nextjs.org/docs/configuring/static-export
+Learn more: https://nextjs.org/docs/app/building-your-application/deploying/static-exports
 
 ## Deploy your own
-
-Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_medium=readme&utm_campaign=next-example) or preview live with [StackBlitz](https://stackblitz.com/github/vercel/next.js/tree/canary/examples/with-static-export)
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vercel/next.js/tree/canary/examples/with-static-export)
 

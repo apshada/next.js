@@ -1,19 +1,19 @@
-import React from 'react'
-import ReactMarkdown from 'react-markdown'
-import Link from 'next/link'
-import { PostProps } from '../pages/blog/[id]'
+import React from "react";
+import { Streamdown } from "streamdown";
+import Link from "next/link";
+import { PostProps } from "../pages/blog/[id]";
 
 const Post: React.FC<{ post: PostProps }> = ({ post }) => {
   return (
-    <Link href={`/blog/${post.id}`} passHref legacyBehavior>
+    <Link href={`/blog/${post.id}`}>
       <div>
         <h2>{post.title}</h2>
         <small>By {post.authorName}</small>
         <br />
         <br />
-        <ReactMarkdown className={'react-markdown'}>
-          {post.content || ''}
-        </ReactMarkdown>
+        <Streamdown mode="static" className="streamdown">
+          {post.content || ""}
+        </Streamdown>
         <style jsx>{`
           div {
             color: inherit;
@@ -27,14 +27,14 @@ const Post: React.FC<{ post: PostProps }> = ({ post }) => {
           small {
             color: #888;
           }
-          .react-markdown,
-          .react-markdown > p {
+          .streamdown,
+          .streamdown > p {
             margin: 0px;
           }
         `}</style>
       </div>
     </Link>
-  )
-}
+  );
+};
 
-export default Post
+export default Post;

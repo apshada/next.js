@@ -1,23 +1,17 @@
 /* eslint-env jest */
 
 import { join } from 'path'
-import { NextInstance } from 'test/lib/next-modes/base'
 import { fetchViaHTTP } from 'next-test-utils'
-import { createNext, FileRef } from 'e2e-utils'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 import cheerio from 'cheerio'
 
 describe('Middleware Request Headers Overrides', () => {
-  let next: NextInstance
-
-  afterAll(() => next.destroy())
-  beforeAll(async () => {
-    next = await createNext({
-      files: {
-        pages: new FileRef(join(__dirname, '../app/pages')),
-        'next.config.js': new FileRef(join(__dirname, '../app/next.config.js')),
-        'middleware.js': new FileRef(join(__dirname, '../app/middleware.js')),
-      },
-    })
+  const { next } = nextTestSetup({
+    files: {
+      pages: new FileRef(join(__dirname, '../app/pages')),
+      'next.config.js': new FileRef(join(__dirname, '../app/next.config.js')),
+      'middleware.js': new FileRef(join(__dirname, '../app/middleware.js')),
+    },
   })
 
   describe.each([

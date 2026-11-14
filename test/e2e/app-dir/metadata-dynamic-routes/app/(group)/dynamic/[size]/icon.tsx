@@ -1,4 +1,4 @@
-import { ImageResponse } from 'next/server'
+import { ImageResponse } from 'next/og'
 
 export async function generateImageMetadata({ params }) {
   return [
@@ -15,7 +15,9 @@ export async function generateImageMetadata({ params }) {
   ]
 }
 
-export default function icon({ params, id }) {
+export default async function icon({ params, id }) {
+  const { size } = await params
+  const iconId = await id
   return new ImageResponse(
     (
       <div
@@ -30,7 +32,7 @@ export default function icon({ params, id }) {
           color: '#000',
         }}
       >
-        Icon {params.size} {id}
+        Icon {size} {iconId}
       </div>
     )
   )

@@ -1,45 +1,44 @@
-import { createNextDescribe } from 'e2e-utils'
+import { nextTestSetup } from 'e2e-utils'
 
 import cookies, { nextConfigHeaders } from './cookies.mjs'
 
-function getSetCookieHeaders(res: globalThis.Response): ReadonlyArray<string> {
+function getSetCookieHeaders(res: Response): ReadonlyArray<string> {
   return (
     (res.headers as any).getSetCookie?.() ??
     (res.headers as any).raw()['set-cookie']
   )
 }
 
-createNextDescribe(
-  'set-cookies',
-  {
+// TODO(deploy-test-completion): Re-enable this suite in deploy mode.
+// TODO: re-enable once this behavior is corrected on deploy
+// @force-gate !deploy
+describe('set-cookies', () => {
+  const { next } = nextTestSetup({
     files: __dirname,
-    // TODO: re-enable once this behavior is corrected on deploy
-    skipDeployment: true,
-  },
-  ({ next }) => {
-    describe.each(['edge', 'experimental-edge', 'node'])(
-      'for %s runtime',
-      (runtime) => {
-        describe.each(['pages', 'app'])('for /%s', (dir) => {
-          it('should set two set-cookie headers', async () => {
-            let res = await next.fetch(`/api/${dir}/${runtime}`)
+  })
 
-            let headers = getSetCookieHeaders(res)
+  describe.each([
+    { dir: 'pages', runtimes: ['edge', 'experimental-edge', 'node'] },
+    { dir: 'app', runtimes: ['edge', 'node'] },
+  ])('for /$dir', ({ dir, runtimes }) => {
+    describe.each(runtimes)('for %s runtime', (runtime) => {
+      it('should set two set-cookie headers', async () => {
+        let res = await next.fetch(`/api/${dir}/${runtime}`)
 
-            expect(headers).toHaveLength(2)
-            expect(headers).toEqual(cookies)
+        let headers = getSetCookieHeaders(res)
 
-            res = await next.fetch(
-              `/api/${dir}/${runtime}?next-config-headers=true`
-            )
+        expect(headers).toHaveLength(2)
+        expect(headers).toEqual(cookies)
 
-            headers = getSetCookieHeaders(res)
+        res = await next.fetch(
+          `/api/${dir}/${runtime}?next-config-headers=true`
+        )
 
-            expect(headers).toHaveLength(4)
-            expect(headers).toEqual([...nextConfigHeaders, ...cookies])
-          })
-        })
-      }
-    )
-  }
-)
+        headers = getSetCookieHeaders(res)
+
+        expect(headers).toHaveLength(4)
+        expect(headers).toEqual([...nextConfigHeaders, ...cookies])
+      })
+    })
+  })
+})

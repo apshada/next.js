@@ -1,5 +1,9 @@
 import type { IncomingMessage } from 'http'
 import { PassThrough, Readable } from 'stream'
+import bytes from 'next/dist/compiled/bytes'
+import { addRequestMeta } from './request-meta'
+
+const DEFAULT_BODY_CLONE_SIZE_LIMIT = 10 * 1024 * 1024 // 10MB
 
 export function requestToBodyStream(
   context: { ReadableStream: typeof ReadableStream },
@@ -7,12 +11,11 @@ export function requestToBodyStream(
   stream: Readable
 ) {
   return new context.ReadableStream({
-    start(controller) {
-      stream.on('data', (chunk) =>
-        controller.enqueue(new KUint8Array([...new Uint8Array(chunk)]))
-      )
-      stream.on('end', () => controller.close())
-      stream.on('error', (err) => controller.error(err))
+    start: async (controller) => {
+      for await (const chunk of stream) {
+        controller.enqueue(new KUint8Array(chunk))
+      }
+      controller.close()
     },
   })
 }
@@ -38,9 +41,14 @@ export interface CloneableBody {
 }
 
 export function getCloneableBody<T extends IncomingMessage>(
-  readable: T
+  readable: T,
+  sizeLimit?: number
 ): CloneableBody {
-  let buffered: Readable | null = null
+  let buffered: {
+    stream: Readable
+    size: number
+    complete: Promise<void>
+  } | null = null
 
   const endPromise = new Promise<void | { error?: unknown }>(
     (resolve, reject) => {
@@ -64,8 +72,12 @@ export function getCloneableBody<T extends IncomingMessage>(
         if (res && typeof res === 'object' && res.error) {
           throw res.error
         }
-        replaceRequestBody(readable, buffered)
-        buffered = readable
+        await buffered.complete
+        replaceRequestBody(readable, buffered.stream)
+        // Keep this separate from clonableBody: subsequent routing passes can
+        // replace that object, but the request still contains this replay body.
+        addRequestMeta(readable, 'replayBodySize', buffered.size)
+        buffered.stream = readable
       }
     },
     /**
@@ -73,18 +85,55 @@ export function getCloneableBody<T extends IncomingMessage>(
      * to pass into a middleware
      */
     cloneBodyStream() {
-      const input = buffered ?? readable
+      const input = buffered?.stream ?? readable
       const p1 = new PassThrough()
-      const p2 = new PassThrough()
+      // `p2` becomes the buffered body that replaces the original request stream
+      // in `finalize()` via `replaceRequestBody`. Since it is only ever fed via
+      // `.push()`, it must be a plain Readable: a Duplex (PassThrough) would copy
+      // its writable-side internals (`_writableState`, `write`, `end`, ...) onto the
+      // IncomingMessage, making the request look like an unfinished writable stream
+      // and hanging Node stream APIs such as `Readable.toWeb()`.
+      const p2 = new Readable({ read() {} })
+
+      let complete!: () => void
+      const buffer = {
+        stream: p2,
+        size: 0,
+        complete: new Promise<void>((resolve) => {
+          complete = resolve
+        }),
+      }
+      const bodySizeLimit = sizeLimit ?? DEFAULT_BODY_CLONE_SIZE_LIMIT
+      let limitExceeded = false
+
       input.on('data', (chunk) => {
+        if (limitExceeded) return
+
+        if (buffer.size + chunk.length > bodySizeLimit) {
+          limitExceeded = true
+          const urlInfo = readable.url ? ` for ${readable.url}` : ''
+          console.warn(
+            // TODO(jiwon): Update this document link
+            `Request body exceeded ${bytes.format(bodySizeLimit)}${urlInfo}. Only the first ${bytes.format(bodySizeLimit)} will be available unless configured. See https://nextjs.org/docs/app/api-reference/config/next-config-js/middlewareClientMaxBodySize for more details.`
+          )
+          p1.push(null)
+          p2.push(null)
+          complete()
+          return
+        }
+
+        buffer.size += chunk.length
         p1.push(chunk)
         p2.push(chunk)
       })
       input.on('end', () => {
-        p1.push(null)
-        p2.push(null)
+        if (!limitExceeded) {
+          p1.push(null)
+          p2.push(null)
+        }
+        complete()
       })
-      buffered = p2
+      buffered = buffer
       return p1
     },
   }

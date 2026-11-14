@@ -6,7 +6,6 @@
  **/
 
 // eslint typescript has a bug with TS enums
-/* eslint-disable no-shadow */
 
 enum BaseServerSpan {
   handleRequest = 'BaseServer.handleRequest',
@@ -26,10 +25,17 @@ enum BaseServerSpan {
 enum LoadComponentsSpan {
   loadDefaultErrorComponents = 'LoadComponents.loadDefaultErrorComponents',
   loadComponents = 'LoadComponents.loadComponents',
+  loadRouteModule = 'LoadComponents.loadRouteModule',
+}
+
+enum InstrumentationSpan {
+  loadModule = 'Instrumentation.loadModule',
+  register = 'Instrumentation.register',
 }
 
 enum NextServerSpan {
   getRequestHandler = 'NextServer.getRequestHandler',
+  getRequestHandlerWithMetadata = 'NextServer.getRequestHandlerWithMetadata',
   getServer = 'NextServer.getServer',
   getServerRequestHandler = 'NextServer.getServerRequestHandler',
   createServer = 'createServer.createServer',
@@ -38,16 +44,17 @@ enum NextServerSpan {
 enum NextNodeServerSpan {
   compression = 'NextNodeServer.compression',
   getBuildId = 'NextNodeServer.getBuildId',
+  createComponentTree = 'NextNodeServer.createComponentTree',
+  clientComponentLoading = 'NextNodeServer.clientComponentLoading',
+  getLayoutOrPageModule = 'NextNodeServer.getLayoutOrPageModule',
   generateStaticRoutes = 'NextNodeServer.generateStaticRoutes',
   generateFsStaticRoutes = 'NextNodeServer.generateFsStaticRoutes',
   generatePublicRoutes = 'NextNodeServer.generatePublicRoutes',
   generateImageRoutes = 'NextNodeServer.generateImageRoutes.route',
   sendRenderResult = 'NextNodeServer.sendRenderResult',
-  sendStatic = 'NextNodeServer.sendStatic',
   proxyRequest = 'NextNodeServer.proxyRequest',
   runApi = 'NextNodeServer.runApi',
   render = 'NextNodeServer.render',
-  renderHTML = 'NextNodeServer.renderHTML',
   imageOptimizer = 'NextNodeServer.imageOptimizer',
   getPagePath = 'NextNodeServer.getPagePath',
   getRoutesManifest = 'NextNodeServer.getRoutesManifest',
@@ -59,11 +66,13 @@ enum NextNodeServerSpan {
   renderError = 'NextNodeServer.renderError',
   renderErrorToHTML = 'NextNodeServer.renderErrorToHTML',
   render404 = 'NextNodeServer.render404',
+  startResponse = 'NextNodeServer.startResponse',
 
   // nested inner span, does not require parent scope name
   route = 'route',
   onProxyReq = 'onProxyReq',
   apiResolver = 'apiResolver',
+  internalFetch = 'internalFetch',
 }
 
 enum StartServerSpan {
@@ -83,6 +92,18 @@ enum AppRenderSpan {
   renderToReadableStream = 'AppRender.renderToReadableStream',
   getBodyResult = 'AppRender.getBodyResult',
   fetch = 'AppRender.fetch',
+  waitShellReady = 'AppRender.waitShellReady',
+  renderToNodeFizzStream = 'AppRender.renderToNodeFizzStream',
+  instantInsights = 'AppRender.instantInsights',
+  instantInsightsPrepareValidation = 'AppRender.instantInsights.prepareValidation',
+  instantInsightsRunValidation = 'AppRender.instantInsights.runValidation',
+  instantInsightsWarmup = 'AppRender.instantInsights.warmup',
+  instantInsightsStaticShell = 'AppRender.instantInsights.staticShell',
+  instantInsightsValidate = 'AppRender.instantInsights.validate',
+}
+
+enum DevBundlerServiceSpan {
+  ensurePage = 'DevBundlerService.ensurePage',
 }
 
 enum RouterSpan {
@@ -97,47 +118,101 @@ enum AppRouteRouteHandlersSpan {
   runHandler = 'AppRouteRouteHandlers.runHandler',
 }
 
+enum AppRouteRouteModuleSpan {
+  loadUserland = 'AppRouteRouteModule.loadUserland',
+}
+
+enum RouteModuleSpan {
+  prepare = 'RouteModule.prepare',
+  loadManifests = 'RouteModule.loadManifests',
+}
 enum ResolveMetadataSpan {
   generateMetadata = 'ResolveMetadata.generateMetadata',
+  generateViewport = 'ResolveMetadata.generateViewport',
+}
+
+enum MiddlewareSpan {
+  execute = 'Middleware.execute',
+}
+
+enum NextSpan {
+  // Root span inserted by the middleware adapter when the request has no
+  // trace context (separately invoked middleware without a parent), so the
+  // middleware and the render are siblings in one trace.
+  request = 'Next.request',
 }
 
 type SpanTypes =
   | `${BaseServerSpan}`
   | `${LoadComponentsSpan}`
+  | `${InstrumentationSpan}`
   | `${NextServerSpan}`
   | `${StartServerSpan}`
   | `${NextNodeServerSpan}`
   | `${RenderSpan}`
   | `${RouterSpan}`
   | `${AppRenderSpan}`
+  | `${DevBundlerServiceSpan}`
   | `${NodeSpan}`
   | `${AppRouteRouteHandlersSpan}`
+  | `${AppRouteRouteModuleSpan}`
+  | `${RouteModuleSpan}`
   | `${ResolveMetadataSpan}`
+  | `${MiddlewareSpan}`
+  | `${NextSpan}`
 
 // This list is used to filter out spans that are not relevant to the user
-export const NextVanillaSpanAllowlist = [
+export const NextVanillaSpanAllowlist = new Set([
+  MiddlewareSpan.execute,
+  NextSpan.request,
   BaseServerSpan.handleRequest,
   RenderSpan.getServerSideProps,
   RenderSpan.getStaticProps,
   AppRenderSpan.fetch,
   AppRenderSpan.getBodyResult,
+  LoadComponentsSpan.loadRouteModule,
   RenderSpan.renderDocument,
   NodeSpan.runHandler,
   AppRouteRouteHandlersSpan.runHandler,
+  AppRouteRouteModuleSpan.loadUserland,
+  RouteModuleSpan.prepare,
+  InstrumentationSpan.loadModule,
+  InstrumentationSpan.register,
   ResolveMetadataSpan.generateMetadata,
-]
+  ResolveMetadataSpan.generateViewport,
+  NextNodeServerSpan.createComponentTree,
+  NextNodeServerSpan.findPageComponents,
+  NextNodeServerSpan.getLayoutOrPageModule,
+  NextNodeServerSpan.startResponse,
+  NextNodeServerSpan.clientComponentLoading,
+])
+
+// These Spans are allowed to be always logged
+// when the otel log prefix env is set
+export const LogSpanAllowList = new Set([
+  NextNodeServerSpan.findPageComponents,
+  NextNodeServerSpan.createComponentTree,
+  NextNodeServerSpan.clientComponentLoading,
+])
 
 export {
   BaseServerSpan,
   LoadComponentsSpan,
+  InstrumentationSpan,
   NextServerSpan,
   NextNodeServerSpan,
   StartServerSpan,
-  SpanTypes,
   RenderSpan,
   RouterSpan,
   AppRenderSpan,
+  DevBundlerServiceSpan,
   NodeSpan,
   AppRouteRouteHandlersSpan,
+  AppRouteRouteModuleSpan,
+  RouteModuleSpan,
   ResolveMetadataSpan,
+  MiddlewareSpan,
+  NextSpan,
 }
+
+export type { SpanTypes }

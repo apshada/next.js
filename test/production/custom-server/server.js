@@ -1,36 +1,70 @@
 const { createServer } = require('http')
 const { parse } = require('url')
 const next = require('next')
+const getPort = require('get-port')
+const { requestIdStorage } = require('./als')
+const quiet = process.env.USE_QUIET === 'true'
 
-const hostname = 'localhost'
-const port = 3000
-// when using middleware `hostname` and `port` must be provided below
-const app = next({ hostname, port })
-const handle = app.getRequestHandler()
+let requestId = 0
 
-app.prepare().then(() => {
-  createServer(async (req, res) => {
-    try {
-      // Be sure to pass `true` as the second argument to `url.parse`.
-      // This tells it to parse the query portion of the URL.
-      const parsedUrl = parse(req.url, true)
-      const { pathname, query } = parsedUrl
+async function main() {
+  const port = await getPort()
+  const hostname = 'localhost'
+  let conf = undefined
 
-      if (pathname === '/a') {
-        await app.render(req, res, '/a', query)
-      } else if (pathname === '/b') {
-        await app.render(req, res, '/page-b', query)
-      } else {
-        await handle(req, res, parsedUrl)
-      }
-    } catch (err) {
-      console.error('Error occurred handling', req.url, err)
-      res.statusCode = 500
-      res.end('internal server error')
-    }
-  }).listen(port, (err) => {
-    if (err) throw err
-    // Start mode
-    console.log(`started server on url: http://${hostname}:${port}`)
+  if (process.env.PROVIDED_CONFIG) {
+    conf = require('./.next/required-server-files.json').config
+    conf.basePath = '/docs'
+  }
+
+  // when using middleware `hostname` and `port` must be provided below
+  const app = next({ hostname, port, quiet, conf })
+  const handle = app.getRequestHandler()
+
+  app.prepare().then(() => {
+    createServer((req, res) =>
+      requestIdStorage.run(requestId++, async () => {
+        try {
+          // Be sure to pass `true` as the second argument to `url.parse`.
+          // This tells it to parse the query portion of the URL.
+          const parsedUrl = parse(req.url, true)
+          let { pathname } = parsedUrl
+
+          if (conf?.basePath) {
+            pathname = pathname.replace(conf.basePath, '') || '/'
+          }
+
+          if (pathname === '/asset-prefix' && parsedUrl.query.assetPrefix) {
+            app.setAssetPrefix(
+              parsedUrl.query.assetPrefix === 'reset'
+                ? ''
+                : 'https://cdn.example.com'
+            )
+          }
+
+          parsedUrl.pathname =
+            pathname === '/b'
+              ? '/page-b'
+              : pathname === '/error'
+                ? '/page-error'
+                : pathname
+          // TODO: Accept WHATWG URLs in Next.js request handlers
+          await handle(req, res, parsedUrl)
+        } catch (err) {
+          console.error('Error occurred handling', req.url, err)
+          res.statusCode = 500
+          res.end('Internal Server Error')
+        }
+      })
+    ).listen(port, undefined, (err) => {
+      if (err) throw err
+      // Start mode
+      console.log(`- Local: http://${hostname}:${port}`)
+    })
   })
+}
+
+main().catch((err) => {
+  console.error(err)
+  process.exit(1)
 })

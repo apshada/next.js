@@ -1,7 +1,7 @@
 import { traceGlobals } from '../../trace/shared'
-import { Telemetry } from '../storage'
+import type { Telemetry } from '../storage'
 // @ts-ignore JSON
-import { version as nextVersion, optionalDependencies } from 'next/package.json'
+import { optionalDependencies } from 'next/package.json'
 
 const EVENT_PLUGIN_PRESENT = 'NEXT_SWC_LOAD_FAILURE'
 export type EventSwcLoadFailure = {
@@ -14,11 +14,15 @@ export type EventSwcLoadFailure = {
     wasm?: 'enabled' | 'fallback' | 'failed'
     glibcVersion?: string
     installedSwcPackages?: string
+    nativeBindingsErrorCode?: string
   }
 }
 
 export async function eventSwcLoadFailure(
-  event?: EventSwcLoadFailure['payload']
+  event?: Pick<
+    EventSwcLoadFailure['payload'],
+    'wasm' | 'nativeBindingsErrorCode'
+  >
 ): Promise<void> {
   const telemetry: Telemetry | undefined = traceGlobals.get('telemetry')
   // can't continue if telemetry isn't set
@@ -30,7 +34,7 @@ export async function eventSwcLoadFailure(
   try {
     // @ts-ignore
     glibcVersion = process.report?.getReport().header.glibcVersionRuntime
-  } catch (_) {}
+  } catch {}
 
   try {
     const pkgNames = Object.keys(optionalDependencies || {}).filter((pkg) =>
@@ -42,24 +46,25 @@ export async function eventSwcLoadFailure(
       try {
         const { version } = require(`${pkg}/package.json`)
         installedPkgs.push(`${pkg}@${version}`)
-      } catch (_) {}
+      } catch {}
     }
 
     if (installedPkgs.length > 0) {
       installedSwcPackages = installedPkgs.sort().join(',')
     }
-  } catch (_) {}
+  } catch {}
 
   telemetry.record({
     eventName: EVENT_PLUGIN_PRESENT,
     payload: {
-      nextVersion,
+      nextVersion: process.env.__NEXT_VERSION as string,
       glibcVersion,
       installedSwcPackages,
       arch: process.arch,
       platform: process.platform,
       nodeVersion: process.versions.node,
       wasm: event?.wasm,
+      nativeBindingsErrorCode: event?.nativeBindingsErrorCode,
     },
   })
   // ensure this event is flushed before process exits

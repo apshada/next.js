@@ -1,34 +1,30 @@
 import fs from 'fs'
 import path from 'path'
-import { Telemetry, TelemetryEvent } from './storage'
-import loadConfig from '../server/config'
+import type { TelemetryEvent } from './storage'
+import { Telemetry } from './storage'
 import { getProjectDir } from '../lib/get-project-dir'
-import { PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
+
+// A detached process has no parent left to clean it up if work never settles.
+// Leave normal exit (including draining debug output) to Node, but bound its lifetime.
+setTimeout(() => process.exit(0), 10 * 60 * 1000).unref()
 
 // this process should be started with following arg order
 // 1. mode e.g. dev, export, start
 // 2. project dir
+// 3. events filename
+// 4. resolved dist directory
 ;(async () => {
-  const args = [...process.argv]
-  let dir = args.pop()
-  const mode = args.pop()
+  const [mode, inputDir, eventsFile, suppliedDistDir] = process.argv.slice(2)
 
-  if (!dir || mode !== 'dev') {
+  if (!inputDir || mode !== 'dev' || !eventsFile || !suppliedDistDir) {
     throw new Error(
-      `Invalid flags should be run as node detached-flush dev ./path-to/project`
+      `Invalid flags should be run as node detached-flush dev <projectDir> <eventsFile> <distDir>`
     )
   }
-  dir = getProjectDir(dir)
+  getProjectDir(inputDir)
 
-  const config = await loadConfig(
-    PHASE_DEVELOPMENT_SERVER,
-    dir,
-    undefined,
-    undefined,
-    true
-  )
-  const distDir = path.join(dir, config.distDir || '.next')
-  const eventsPath = path.join(distDir, '_events.json')
+  const distDir = path.resolve(suppliedDistDir)
+  const eventsPath = path.join(distDir, 'cache', eventsFile)
 
   let events: TelemetryEvent[]
   try {
@@ -45,7 +41,8 @@ import { PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
   await telemetry.record(events)
   await telemetry.flush()
 
-  // finished flushing events clean-up/exit
+  // finished flushing events clean-up
   fs.unlinkSync(eventsPath)
-  process.exit(0)
+  // Don't call process.exit() here - let Node.js exit naturally after
+  // all pending work completes (e.g., setTimeout in debug telemetry)
 })()

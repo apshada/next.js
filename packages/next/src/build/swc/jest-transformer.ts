@@ -36,17 +36,20 @@ import type {
 } from '@jest/transform'
 import type { Config } from '@jest/types'
 import type { NextConfig, ExperimentalConfig } from '../../server/config-shared'
+import type { ResolvedBaseUrl } from '../load-jsconfig'
 
 type TransformerConfig = Config.TransformerConfig[1]
 export interface JestTransformerConfig extends TransformerConfig {
   jsConfig: any
-  resolvedBaseUrl?: string
+  resolvedBaseUrl?: ResolvedBaseUrl
   pagesDir?: string
-  hasServerComponents?: boolean
+  configDir?: string
+  serverComponents?: boolean
   isEsmProject: boolean
   modularizeImports?: NextConfig['modularizeImports']
   swcPlugins: ExperimentalConfig['swcPlugins']
   compilerOptions: NextConfig['compiler']
+  imageConfig?: Partial<NextConfig['images']>
 }
 
 // Jest use the `vm` [Module API](https://nodejs.org/api/vm.html#vm_class_vm_module) for ESM.
@@ -83,19 +86,21 @@ const createTransformer: TransformerCreator<
   process(src, filename, jestOptions) {
     const jestConfig = getJestConfig(jestOptions)
 
-    let swcTransformOpts = getJestSWCOptions({
-      // When target is node it's similar to the server option set in SWC.
-      isServer: jestConfig.testEnvironment
-        ? jestConfig.testEnvironment === 'node'
-        : false,
+    const swcTransformOpts = getJestSWCOptions({
+      isServer:
+        jestConfig.testEnvironment === 'node' ||
+        jestConfig.testEnvironment.includes('jest-environment-node'),
       filename,
+      configDir: inputOptions?.configDir,
       jsConfig: inputOptions?.jsConfig,
       resolvedBaseUrl: inputOptions?.resolvedBaseUrl,
       pagesDir: inputOptions?.pagesDir,
-      hasServerComponents: inputOptions?.hasServerComponents,
+      serverComponents: inputOptions?.serverComponents,
       modularizeImports: inputOptions?.modularizeImports,
       swcPlugins: inputOptions?.swcPlugins,
       compilerOptions: inputOptions?.compilerOptions,
+      imageConfig: inputOptions?.imageConfig,
+      serverReferenceHashSalt: '',
       esm:
         isSupportEsm &&
         isEsm(Boolean(inputOptions?.isEsmProject), filename, jestConfig),

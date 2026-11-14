@@ -1,31 +1,56 @@
 import type { NextConfig } from '../../server/config-shared'
-import type { Middleware, RouteHas } from '../../lib/load-custom-routes'
+import type { RouteHas } from '../../lib/load-custom-routes'
 
-import { promises as fs } from 'fs'
-import LRUCache from 'next/dist/compiled/lru-cache'
-import { matcher } from 'next/dist/compiled/micromatch'
-import { ServerRuntime } from 'next/types'
-import {
-  extractExportedConstValue,
-  UnsupportedValueError,
-} from './extract-const-value'
+import { readFileSync } from 'fs'
+import { relative } from 'path'
+import { LRUCache } from '../../server/lib/lru-cache'
+import { extractExportedConstValue } from './extract-const-value'
 import { parseModule } from './parse-module'
 import * as Log from '../output/log'
-import { SERVER_RUNTIME } from '../../lib/constants'
-import { checkCustomRoutes } from '../../lib/load-custom-routes'
+import {
+  SERVER_RUNTIME,
+  MIDDLEWARE_FILENAME,
+  PROXY_FILENAME,
+  RSC_SUFFIX,
+  RSC_SEGMENT_SUFFIX,
+  RSC_SEGMENTS_DIR_SUFFIX,
+} from '../../lib/constants'
 import { tryToParsePath } from '../../lib/try-to-parse-path'
 import { isAPIRoute } from '../../lib/is-api-route'
 import { isEdgeRuntime } from '../../lib/is-edge-runtime'
+import {
+  warnAboutEdgeRuntime,
+  warnAboutPreferredRegion,
+} from '../warn-about-edge-runtime'
 import { RSC_MODULE_TYPES } from '../../shared/lib/constants'
+import { escapeStringRegexp } from '../../shared/lib/escape-regexp'
 import type { RSCMeta } from '../webpack/loaders/get-module-build-info'
+import { PAGE_TYPES } from '../../lib/page-types'
+import {
+  AppSegmentConfigSchemaKeys,
+  parseAppSegmentConfig,
+  type AppSegmentConfig,
+} from '../segment-config/app/app-segment-config'
+import { reportZodError } from '../../shared/lib/zod'
+import {
+  PagesSegmentConfigSchemaKeys,
+  parsePagesSegmentConfig,
+  type PagesSegmentConfig,
+  type PagesSegmentConfigConfig,
+} from '../segment-config/pages/pages-segment-config'
+import {
+  MiddlewareConfigInputSchema,
+  SourceSchema,
+  type MiddlewareConfigMatcherInput,
+} from '../segment-config/middleware/middleware-config'
+import { normalizeAppPath } from '../../shared/lib/router/utils/app-paths'
+import { normalizePagePath } from '../../shared/lib/page-path/normalize-page-path'
+import { isProxyFile } from '../utils'
 
-export interface MiddlewareConfig {
-  matchers: MiddlewareMatcher[]
-  unstable_allowDynamicGlobs: string[]
-  regions: string[] | string
-}
+const PARSE_PATTERN =
+  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|unstable_paramMatching|unstable_generateParamMatching|export const|generateImageMetadata|generateSitemaps|middleware|proxy/
 
-export interface MiddlewareMatcher {
+export type ProxyMatcher = {
   regexp: string
   locale?: false
   has?: RouteHas[]
@@ -33,42 +58,109 @@ export interface MiddlewareMatcher {
   originalSource: string
 }
 
-export interface PageStaticInfo {
-  runtime?: ServerRuntime
-  preferredRegion?: string | string[]
+export type ProxyConfig = {
+  /**
+   * The matcher for the proxy. Read more: [Next.js Docs: Proxy `matcher`](https://nextjs.org/docs/app/api-reference/file-conventions/proxy#matcher),
+   * [Next.js Docs: Proxy matching paths](https://nextjs.org/docs/app/building-your-application/routing/proxy#matching-paths)
+   */
+  matchers?: ProxyMatcher[]
+
+  /**
+   * The regions that the proxy should run in.
+   */
+  regions?: string | string[]
+
+  /**
+   * A glob, or an array of globs, ignoring dynamic code evaluation for specific
+   * files. The globs are relative to your application root folder.
+   */
+  unstable_allowDynamic?: string[]
+}
+
+export interface SharedPageStaticInfo {
+  generateSitemaps?: boolean
+  generateImageMetadata?: boolean
+  middleware?: ProxyConfig
+  maxDuration: number | undefined
+  hadUnsupportedValue: boolean
+}
+
+export interface AppPageStaticInfo extends SharedPageStaticInfo {
+  type: PAGE_TYPES.APP
   ssg?: boolean
   ssr?: boolean
-  rsc?: RSCModuleType
-  middleware?: Partial<MiddlewareConfig>
+  config: Omit<AppSegmentConfig, 'runtime' | 'maxDuration'> | undefined
+  runtime: AppSegmentConfig['runtime'] | undefined
+  preferredRegion: AppSegmentConfig['preferredRegion'] | undefined
 }
+
+export interface PagesPageStaticInfo extends SharedPageStaticInfo {
+  type: PAGE_TYPES.PAGES
+  config:
+    | (Omit<PagesSegmentConfig, 'runtime' | 'config' | 'maxDuration'> & {
+        config?: Omit<PagesSegmentConfigConfig, 'runtime' | 'maxDuration'>
+      })
+    | undefined
+  runtime: PagesSegmentConfig['runtime'] | undefined
+  preferredRegion: PagesSegmentConfigConfig['regions'] | undefined
+}
+
+export type PageStaticInfo = AppPageStaticInfo | PagesPageStaticInfo
+
+const APP_ROUTE_RSC_SUFFIX_MATCHER = escapeStringRegexp(RSC_SUFFIX)
+const APP_ROUTE_SEGMENT_PREFETCH_SUFFIX_MATCHER = `${escapeStringRegexp(RSC_SEGMENTS_DIR_SUFFIX)}/.+${escapeStringRegexp(RSC_SEGMENT_SUFFIX)}`
+const APP_ROUTE_TRANSPORT_SUFFIX_MATCHER = `${APP_ROUTE_RSC_SUFFIX_MATCHER}|${APP_ROUTE_SEGMENT_PREFETCH_SUFFIX_MATCHER}`
+const ROOT_APP_ROUTE_TRANSPORT_MATCHER = `/?index(?:${APP_ROUTE_TRANSPORT_SUFFIX_MATCHER})`
+const MIDDLEWARE_DATA_SUFFIX_MATCHER = `\\.json|${APP_ROUTE_TRANSPORT_SUFFIX_MATCHER}`
+const OPTIONAL_MIDDLEWARE_NEXT_DATA_PREFIX = '/:nextData(_next/data/[^/]{1,})?'
 
 const CLIENT_MODULE_LABEL =
   /\/\* __next_internal_client_entry_do_not_use__ ([^ ]*) (cjs|auto) \*\//
+
+// Match JSON object that may contain nested objects (for loc info)
+// The JSON ends right before the closing " */"
 const ACTION_MODULE_LABEL =
-  /\/\* __next_internal_action_entry_do_not_use__ ([^ ]+) \*\//
+  /\/\* __next_internal_action_entry_do_not_use__ (\{.*\}) \*\//
+
+const CLIENT_DIRECTIVE = 'use client'
+const SERVER_ACTION_DIRECTIVE = 'use server'
 
 export type RSCModuleType = 'server' | 'client'
 export function getRSCModuleInformation(
   source: string,
-  isServerLayer = true
+  isReactServerLayer: boolean
 ): RSCMeta {
-  const actions = source.match(ACTION_MODULE_LABEL)?.[1]?.split(',')
+  const actionsJson = source.match(ACTION_MODULE_LABEL)
+  // Parse action metadata - supports both old format (string) and new format (object with loc)
+  const parsedActionsMeta = actionsJson
+    ? (JSON.parse(actionsJson[1]) as RSCMeta['actionIds'])
+    : undefined
   const clientInfoMatch = source.match(CLIENT_MODULE_LABEL)
   const isClientRef = !!clientInfoMatch
 
-  if (!isServerLayer) {
+  if (!isReactServerLayer) {
     return {
       type: RSC_MODULE_TYPES.client,
-      actions,
+      actionIds: parsedActionsMeta,
       isClientRef,
     }
   }
 
-  const clientRefs = clientInfoMatch?.[1]?.split(',')
-  const clientEntryType = clientInfoMatch?.[2] as 'cjs' | 'auto'
+  const clientRefsString = clientInfoMatch?.[1]
+  const clientRefs = clientRefsString ? clientRefsString.split(',') : []
+  const clientEntryType = clientInfoMatch?.[2] as 'cjs' | 'auto' | undefined
 
-  const type = clientRefs ? RSC_MODULE_TYPES.client : RSC_MODULE_TYPES.server
-  return { type, actions, clientRefs, clientEntryType, isClientRef }
+  const type = clientInfoMatch
+    ? RSC_MODULE_TYPES.client
+    : RSC_MODULE_TYPES.server
+
+  return {
+    type,
+    actionIds: parsedActionsMeta,
+    clientRefs,
+    clientEntryType,
+    isClientRef,
+  }
 }
 
 /**
@@ -78,215 +170,410 @@ export function getRSCModuleInformation(
  *   - Modules with `export { getStaticProps | getServerSideProps } <from ...>`
  *   - Modules with `export const runtime = ...`
  */
-function checkExports(swcAST: any): {
-  ssr: boolean
-  ssg: boolean
-  runtime?: string
-  preferredRegion?: string | string[]
+function checkExports(
+  ast: any,
+  expectedExports: string[],
+  page: string
+): {
+  getStaticProps?: boolean
+  getServerSideProps?: boolean
+  generateImageMetadata?: boolean
+  generateSitemaps?: boolean
+  paramMatching?: boolean
+  generateParamMatching?: boolean
+  generateStaticParams?: boolean
+  directives?: Set<string>
+  exports?: Set<string>
 } {
-  if (Array.isArray(swcAST?.body)) {
-    try {
-      let runtime: string | undefined
-      let preferredRegion: string | string[] | undefined
-      let ssr: boolean = false
-      let ssg: boolean = false
+  const exportsSet = new Set<string>([
+    'getStaticProps',
+    'getServerSideProps',
+    'generateImageMetadata',
+    'generateSitemaps',
+    'unstable_paramMatching',
+    'unstable_generateParamMatching',
+    'generateStaticParams',
+  ])
+  if (!Array.isArray(ast?.body)) {
+    return {}
+  }
 
-      for (const node of swcAST.body) {
-        if (
-          node.type === 'ExportDeclaration' &&
-          node.declaration?.type === 'VariableDeclaration'
-        ) {
-          for (const declaration of node.declaration?.declarations) {
-            if (declaration.id.value === 'runtime') {
-              runtime = declaration.init.value
-            }
+  try {
+    let getStaticProps: boolean = false
+    let getServerSideProps: boolean = false
+    let generateImageMetadata: boolean = false
+    let generateSitemaps: boolean = false
+    let paramMatching = false
+    let generateParamMatching = false
+    let generateStaticParams = false
+    let exports = new Set<string>()
+    let directives = new Set<string>()
+    let hasLeadingNonDirectiveNode = false
 
-            if (declaration.id.value === 'preferredRegion') {
-              if (declaration.init.type === 'ArrayExpression') {
-                const elements: string[] = []
-                for (const element of declaration.init.elements) {
-                  const { expression } = element
-                  if (expression.type !== 'StringLiteral') {
-                    continue
-                  }
-                  elements.push(expression.value)
-                }
-                preferredRegion = elements
-              } else {
-                preferredRegion = declaration.init.value
-              }
-            }
+    for (const node of ast.body) {
+      // There should be no non-string literals nodes before directives
+      if (
+        node.type === 'ExpressionStatement' &&
+        node.expression.type === 'StringLiteral'
+      ) {
+        if (!hasLeadingNonDirectiveNode) {
+          const directive = node.expression.value
+          if (CLIENT_DIRECTIVE === directive) {
+            directives.add('client')
+          }
+          if (SERVER_ACTION_DIRECTIVE === directive) {
+            directives.add('server')
           }
         }
-
-        if (
-          node.type === 'ExportDeclaration' &&
-          node.declaration?.type === 'FunctionDeclaration' &&
-          ['getStaticProps', 'getServerSideProps'].includes(
-            node.declaration.identifier?.value
-          )
-        ) {
-          ssg = node.declaration.identifier.value === 'getStaticProps'
-          ssr = node.declaration.identifier.value === 'getServerSideProps'
-        }
-
-        if (
-          node.type === 'ExportDeclaration' &&
-          node.declaration?.type === 'VariableDeclaration'
-        ) {
-          const id = node.declaration?.declarations[0]?.id.value
-          if (['getStaticProps', 'getServerSideProps'].includes(id)) {
-            ssg = id === 'getStaticProps'
-            ssr = id === 'getServerSideProps'
+      } else {
+        hasLeadingNonDirectiveNode = true
+      }
+      if (
+        node.type === 'ExportDeclaration' &&
+        node.declaration?.type === 'VariableDeclaration'
+      ) {
+        for (const declaration of node.declaration?.declarations) {
+          if (expectedExports.includes(declaration.id.value)) {
+            exports.add(declaration.id.value)
           }
-        }
-
-        if (node.type === 'ExportNamedDeclaration') {
-          const values = node.specifiers.map(
-            (specifier: any) =>
-              specifier.type === 'ExportSpecifier' &&
-              specifier.orig?.type === 'Identifier' &&
-              specifier.orig?.value
-          )
-
-          ssg = values.some((value: any) => ['getStaticProps'].includes(value))
-          ssr = values.some((value: any) =>
-            ['getServerSideProps'].includes(value)
-          )
         }
       }
 
-      return { ssr, ssg, runtime, preferredRegion }
-    } catch (err) {}
-  }
+      if (
+        node.type === 'ExportDeclaration' &&
+        node.declaration?.type === 'FunctionDeclaration' &&
+        exportsSet.has(node.declaration.identifier?.value)
+      ) {
+        const id = node.declaration.identifier.value
+        getServerSideProps = id === 'getServerSideProps'
+        getStaticProps = id === 'getStaticProps'
+        generateImageMetadata = id === 'generateImageMetadata'
+        generateSitemaps = id === 'generateSitemaps'
+        if (id === 'unstable_paramMatching') paramMatching = true
+        if (id === 'unstable_generateParamMatching') {
+          generateParamMatching = true
+        }
+        generateStaticParams = id === 'generateStaticParams'
+      }
 
-  return { ssg: false, ssr: false }
+      if (
+        node.type === 'ExportDeclaration' &&
+        node.declaration?.type === 'VariableDeclaration'
+      ) {
+        const id = node.declaration?.declarations[0]?.id.value
+        if (exportsSet.has(id)) {
+          getServerSideProps = id === 'getServerSideProps'
+          getStaticProps = id === 'getStaticProps'
+          generateImageMetadata = id === 'generateImageMetadata'
+          generateSitemaps = id === 'generateSitemaps'
+          if (id === 'unstable_paramMatching') paramMatching = true
+          if (id === 'unstable_generateParamMatching') {
+            generateParamMatching = true
+          }
+          generateStaticParams = id === 'generateStaticParams'
+        }
+      }
+
+      if (node.type === 'ExportNamedDeclaration') {
+        for (const specifier of node.specifiers) {
+          if (
+            specifier.type === 'ExportSpecifier' &&
+            specifier.orig?.type === 'Identifier'
+          ) {
+            const value = specifier.orig.value
+
+            if (!getServerSideProps && value === 'getServerSideProps') {
+              getServerSideProps = true
+            }
+            if (!getStaticProps && value === 'getStaticProps') {
+              getStaticProps = true
+            }
+            if (!generateImageMetadata && value === 'generateImageMetadata') {
+              generateImageMetadata = true
+            }
+            if (!generateSitemaps && value === 'generateSitemaps') {
+              generateSitemaps = true
+            }
+            if (!paramMatching && value === 'unstable_paramMatching') {
+              paramMatching = true
+            }
+            if (
+              !generateParamMatching &&
+              value === 'unstable_generateParamMatching'
+            ) {
+              generateParamMatching = true
+            }
+            if (!generateStaticParams && value === 'generateStaticParams') {
+              generateStaticParams = true
+            }
+            if (expectedExports.includes(value) && !exports.has(value)) {
+              // An export was found that was actually a re-export, and not a
+              // literal value. We should warn here.
+              Log.warn(
+                `Next.js can't recognize the exported \`${value}\` field in "${page}", it may be re-exported from another file. The default config will be used instead.`
+              )
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      getStaticProps,
+      getServerSideProps,
+      generateImageMetadata,
+      generateSitemaps,
+      paramMatching,
+      generateParamMatching,
+      generateStaticParams,
+      directives,
+      exports,
+    }
+  } catch {}
+
+  return {}
 }
 
-async function tryToReadFile(filePath: string, shouldThrow: boolean) {
+function validateMiddlewareProxyExports({
+  ast,
+  page,
+  pageFilePath,
+  isDev,
+}: {
+  ast: any
+  page: string
+  pageFilePath: string
+  isDev: boolean
+}): void {
+  // Check if this is middleware/proxy
+  const isMiddleware =
+    page === `/${MIDDLEWARE_FILENAME}` || page === `/src/${MIDDLEWARE_FILENAME}`
+  const isProxy =
+    page === `/${PROXY_FILENAME}` || page === `/src/${PROXY_FILENAME}`
+
+  if (!isMiddleware && !isProxy) {
+    return
+  }
+
+  if (!ast || !Array.isArray(ast.body)) {
+    return
+  }
+
+  const fileName = isProxy ? PROXY_FILENAME : MIDDLEWARE_FILENAME
+
+  // Parse AST to get export info (since checkExports doesn't return middleware/proxy info)
+  let hasDefaultExport = false
+  let hasMiddlewareExport = false
+  let hasProxyExport = false
+
+  for (const node of ast.body) {
+    if (
+      node.type === 'ExportDefaultDeclaration' ||
+      node.type === 'ExportDefaultExpression'
+    ) {
+      hasDefaultExport = true
+    }
+
+    if (
+      node.type === 'ExportDeclaration' &&
+      node.declaration?.type === 'FunctionDeclaration'
+    ) {
+      const id = node.declaration.identifier?.value
+      if (id === 'middleware') {
+        hasMiddlewareExport = true
+      }
+      if (id === 'proxy') {
+        hasProxyExport = true
+      }
+    }
+
+    if (
+      node.type === 'ExportDeclaration' &&
+      node.declaration?.type === 'VariableDeclaration'
+    ) {
+      const id = node.declaration?.declarations[0]?.id.value
+      if (id === 'middleware') {
+        hasMiddlewareExport = true
+      }
+      if (id === 'proxy') {
+        hasProxyExport = true
+      }
+    }
+
+    if (node.type === 'ExportNamedDeclaration') {
+      for (const specifier of node.specifiers) {
+        if (
+          specifier.type === 'ExportSpecifier' &&
+          specifier.orig?.type === 'Identifier'
+        ) {
+          // Use the exported name if it exists (for aliased exports like `export { foo as proxy }`),
+          // otherwise fall back to the original name (for simple re-exports like `export { proxy }`)
+          const exportedIdentifier = specifier.exported || specifier.orig
+          const value = exportedIdentifier.value
+          if (value === 'middleware') {
+            hasMiddlewareExport = true
+          }
+          if (value === 'proxy') {
+            hasProxyExport = true
+          }
+        }
+      }
+    }
+  }
+
+  const hasValidExport =
+    hasDefaultExport ||
+    (isMiddleware && hasMiddlewareExport) ||
+    (isProxy && hasProxyExport)
+
+  const relativePath = relative(process.cwd(), pageFilePath)
+  const resolvedPath = relativePath.startsWith('.')
+    ? relativePath
+    : `./${relativePath}`
+
+  if (!hasValidExport) {
+    const message =
+      `The file "${resolvedPath}" must export a function, either as a default export or as a named "${fileName}" export.\n` +
+      `This function is what Next.js runs for every request handled by this ${fileName === 'proxy' ? 'proxy (previously called middleware)' : 'middleware'}.\n\n` +
+      `Why this happens:\n` +
+      (isProxy
+        ? "- You are migrating from `middleware` to `proxy`, but haven't updated the exported function.\n"
+        : '') +
+      `- The file exists but doesn't export a function.\n` +
+      `- The export is not a function (e.g., an object or constant).\n` +
+      `- There's a syntax error preventing the export from being recognized.\n\n` +
+      `To fix it:\n` +
+      `- Ensure this file has either a default or "${fileName}" function export.\n\n` +
+      `Learn more: https://nextjs.org/docs/messages/middleware-to-proxy`
+
+    if (isDev) {
+      // errorOnce as proxy/middleware runs per request including multiple
+      // internal _next/ routes and spams logs.
+      Log.errorOnce(message)
+    } else {
+      throw new Error(message)
+    }
+  }
+}
+
+function tryToReadFile(filePath: string, shouldThrow: boolean) {
   try {
-    return await fs.readFile(filePath, {
+    return readFileSync(filePath, {
       encoding: 'utf8',
     })
-  } catch (error) {
+  } catch (error: any) {
     if (shouldThrow) {
+      error.message = `Next.js ERROR: Failed to read file ${filePath}:\n${error.message}`
       throw error
     }
   }
 }
 
+/**
+ * @internal - required to exclude zod types from the build
+ */
 export function getMiddlewareMatchers(
-  matcherOrMatchers: unknown,
-  nextConfig: NextConfig
-): MiddlewareMatcher[] {
-  let matchers: unknown[] = []
-  if (Array.isArray(matcherOrMatchers)) {
-    matchers = matcherOrMatchers
-  } else {
-    matchers.push(matcherOrMatchers)
-  }
+  matcherOrMatchers: MiddlewareConfigMatcherInput,
+  nextConfig: Pick<NextConfig, 'basePath' | 'i18n'>
+): ProxyMatcher[] {
+  const matchers = Array.isArray(matcherOrMatchers)
+    ? matcherOrMatchers
+    : [matcherOrMatchers]
+
   const { i18n } = nextConfig
 
-  const originalSourceMap = new Map<Middleware, string>()
-  let routes = matchers.map((m) => {
-    let middleware = (typeof m === 'string' ? { source: m } : m) as Middleware
-    if (middleware) {
-      originalSourceMap.set(middleware, middleware.source)
-    }
-    return middleware
-  })
+  return matchers.map((matcher) => {
+    matcher = typeof matcher === 'string' ? { source: matcher } : matcher
 
-  // check before we process the routes and after to ensure
-  // they are still valid
-  checkCustomRoutes(routes, 'middleware')
+    const originalSource = matcher.source
 
-  routes = routes.map((r) => {
-    let { source } = r
+    let { source, ...rest } = matcher
 
     const isRoot = source === '/'
 
-    if (i18n?.locales && r.locale !== false) {
+    if (i18n?.locales && matcher.locale !== false) {
       source = `/:nextInternalLocale((?!_next/)[^/.]{1,})${
         isRoot ? '' : source
       }`
     }
 
-    source = `/:nextData(_next/data/[^/]{1,})?${source}${
+    // Match transport-specific route forms that resolve to the same page.
+    // - Pages Router data routes: /_next/data/<build-id>/...
+    // - App Router transport routes: .rsc, ...segments/...segment.rsc
+    const sourceSuffix = `${
       isRoot
-        ? `(${nextConfig.i18n ? '|\\.json|' : ''}/?index|/?index\\.json)?`
-        : '(.json)?'
+        ? `(${
+            nextConfig.i18n ? '|\\.json|' : ''
+          }/?index|/?index\\.json|${ROOT_APP_ROUTE_TRANSPORT_MATCHER})?`
+        : `{(${MIDDLEWARE_DATA_SUFFIX_MATCHER})}?`
     }`
+    source = `${OPTIONAL_MIDDLEWARE_NEXT_DATA_PREFIX}${source}${sourceSuffix}`
 
     if (nextConfig.basePath) {
       source = `${nextConfig.basePath}${source}`
     }
 
-    r.source = source
-    return r
-  })
+    // Validate that the source is still.
+    const result = SourceSchema.safeParse(source)
+    if (!result.success) {
+      reportZodError('Failed to parse middleware source', result.error)
 
-  checkCustomRoutes(routes, 'middleware')
-
-  return routes.map((r) => {
-    const { source, ...rest } = r
-    const parsedPage = tryToParsePath(source)
-
-    if (parsedPage.error || !parsedPage.regexStr) {
-      throw new Error(`Invalid source: ${source}`)
+      // We need to exit here because middleware being built occurs before we
+      // finish setting up the server. Exiting here is the only way to ensure
+      // that we don't hang.
+      process.exit(1)
     }
-
-    const originalSource = originalSourceMap.get(r)
 
     return {
       ...rest,
-      regexp: parsedPage.regexStr,
+      // We know that parsed.regexStr is not undefined because we already
+      // checked that the source is valid.
+      regexp: tryToParsePath(result.data).regexStr!,
       originalSource: originalSource || source,
     }
   })
 }
 
-function getMiddlewareConfig(
-  pageFilePath: string,
-  config: any,
+function parseMiddlewareConfig(
+  page: string,
+  rawConfig: unknown,
   nextConfig: NextConfig
-): Partial<MiddlewareConfig> {
-  const result: Partial<MiddlewareConfig> = {}
+): ProxyConfig {
+  // If there's no config to parse, then return nothing.
+  if (typeof rawConfig !== 'object' || !rawConfig) return {}
 
-  if (config.matcher) {
-    result.matchers = getMiddlewareMatchers(config.matcher, nextConfig)
+  const input = MiddlewareConfigInputSchema.safeParse(rawConfig)
+  if (!input.success) {
+    reportZodError(`${page} contains invalid middleware config`, input.error)
+
+    // We need to exit here because middleware being built occurs before we
+    // finish setting up the server. Exiting here is the only way to ensure
+    // that we don't hang.
+    process.exit(1)
   }
 
-  if (typeof config.regions === 'string' || Array.isArray(config.regions)) {
-    result.regions = config.regions
-  } else if (typeof config.regions !== 'undefined') {
-    Log.warn(
-      `The \`regions\` config was ignored: config must be empty, a string or an array of strings. (${pageFilePath})`
+  const config: ProxyConfig = {}
+
+  if (input.data.matcher) {
+    config.matchers = getMiddlewareMatchers(input.data.matcher, nextConfig)
+  }
+
+  if (input.data.unstable_allowDynamic) {
+    config.unstable_allowDynamic = Array.isArray(
+      input.data.unstable_allowDynamic
     )
+      ? input.data.unstable_allowDynamic
+      : [input.data.unstable_allowDynamic]
   }
 
-  if (config.unstable_allowDynamic) {
-    result.unstable_allowDynamicGlobs = Array.isArray(
-      config.unstable_allowDynamic
-    )
-      ? config.unstable_allowDynamic
-      : [config.unstable_allowDynamic]
-    for (const glob of result.unstable_allowDynamicGlobs ?? []) {
-      try {
-        matcher(glob)
-      } catch (err) {
-        throw new Error(
-          `${pageFilePath} exported 'config.unstable_allowDynamic' contains invalid pattern '${glob}': ${
-            (err as Error).message
-          }`
-        )
-      }
-    }
+  if (input.data.regions) {
+    config.regions = input.data.regions
   }
 
-  return result
+  return config
 }
 
-const apiRouteWarnings = new LRUCache({ max: 250 })
+const apiRouteWarnings = new LRUCache(250)
 function warnAboutExperimentalEdge(apiRoute: string | null) {
   if (
     process.env.NODE_ENV === 'production' &&
@@ -294,39 +581,339 @@ function warnAboutExperimentalEdge(apiRoute: string | null) {
   ) {
     return
   }
-  if (apiRouteWarnings.has(apiRoute)) {
+
+  if (apiRoute && apiRouteWarnings.has(apiRoute)) {
     return
   }
+
   Log.warn(
     apiRoute
       ? `${apiRoute} provided runtime 'experimental-edge'. It can be updated to 'edge' instead.`
       : `You are using an experimental edge runtime, the API might change.`
   )
-  apiRouteWarnings.set(apiRoute, 1)
+
+  if (apiRoute) {
+    apiRouteWarnings.set(apiRoute, 1)
+  }
 }
 
-const warnedUnsupportedValueMap = new Map<string, boolean>()
+let hadUnsupportedValue = false
+const warnedUnsupportedValueMap = new LRUCache<boolean>(250, () => 1)
+
 function warnAboutUnsupportedValue(
   pageFilePath: string,
   page: string | undefined,
-  error: UnsupportedValueError
+  result: { unsupported: string; path?: string }
 ) {
-  if (warnedUnsupportedValueMap.has(pageFilePath)) {
+  hadUnsupportedValue = true
+  const isProductionBuild = process.env.NODE_ENV === 'production'
+  if (
+    // we only log for the server compilation so it's not
+    // duplicated due to webpack build worker having fresh
+    // module scope for each compiler
+    process.env.NEXT_COMPILER_NAME !== 'server' ||
+    (isProductionBuild && warnedUnsupportedValueMap.has(pageFilePath))
+  ) {
     return
   }
-
-  Log.warn(
-    `Next.js can't recognize the exported \`config\` field in ` +
-      (page ? `route "${page}"` : `"${pageFilePath}"`) +
-      ':\n' +
-      error.message +
-      (error.path ? ` at "${error.path}"` : '') +
-      '.\n' +
-      'The default config will be used instead.\n' +
-      'Read More - https://nextjs.org/docs/messages/invalid-page-config'
-  )
-
   warnedUnsupportedValueMap.set(pageFilePath, true)
+
+  const message =
+    `Next.js can't recognize the exported \`config\` field in ` +
+    (page ? `route "${page}"` : `"${pageFilePath}"`) +
+    ':\n' +
+    result.unsupported +
+    (result.path ? ` at "${result.path}"` : '') +
+    '.\n' +
+    'Read More - https://nextjs.org/docs/messages/invalid-page-config'
+
+  // for a build we use `Log.error` instead of throwing
+  // so that all errors can be logged before exiting the process
+  if (isProductionBuild) {
+    Log.error(message)
+  } else {
+    throw new Error(message)
+  }
+}
+
+type GetPageStaticInfoParams = {
+  pageFilePath: string
+  nextConfig: Partial<NextConfig>
+  isDev: boolean
+  page: string
+  pageType: PAGE_TYPES
+}
+
+export async function getAppPageStaticInfo({
+  pageFilePath,
+  nextConfig,
+  isDev,
+  page,
+}: GetPageStaticInfoParams): Promise<AppPageStaticInfo> {
+  if (/(?:^|[\\/])route\.go$/.test(pageFilePath)) {
+    if (!process.env.TURBOPACK)
+      throw new Error('route.go requires Turbopack; remove --webpack')
+    return {
+      type: PAGE_TYPES.APP,
+      config: { dynamic: 'force-dynamic' },
+      runtime: undefined,
+      preferredRegion: undefined,
+      maxDuration: undefined,
+      hadUnsupportedValue: false,
+    }
+  }
+  const content = tryToReadFile(pageFilePath, !isDev)
+  if (!content || !PARSE_PATTERN.test(content)) {
+    return {
+      type: PAGE_TYPES.APP,
+      config: undefined,
+      runtime: undefined,
+      preferredRegion: undefined,
+      maxDuration: undefined,
+      hadUnsupportedValue: false,
+    }
+  }
+
+  const ast = await parseModule(pageFilePath, content)
+  validateMiddlewareProxyExports({
+    ast,
+    page,
+    pageFilePath,
+    isDev,
+  })
+
+  const {
+    paramMatching,
+    generateParamMatching,
+    generateStaticParams,
+    generateImageMetadata,
+    generateSitemaps,
+    exports,
+    directives,
+  } = checkExports(ast, AppSegmentConfigSchemaKeys, page)
+
+  const exportedConfig: Record<string, unknown> = {}
+  if (exports) {
+    for (const property of exports) {
+      const result = extractExportedConstValue(ast, property)
+      if (result !== null && 'unsupported' in result) {
+        warnAboutUnsupportedValue(pageFilePath, page, result)
+      } else if (result !== null) {
+        exportedConfig[property] = result.value
+      }
+    }
+  }
+
+  const configResult = extractExportedConstValue(ast, 'config')
+  if (configResult !== null && 'unsupported' in configResult) {
+    warnAboutUnsupportedValue(pageFilePath, page, configResult)
+  } else if (configResult !== null) {
+    exportedConfig.config = configResult.value
+  }
+
+  const route = normalizeAppPath(page)
+  const config = parseAppSegmentConfig(exportedConfig, route)
+
+  const hasParamMatching = paramMatching || generateParamMatching
+
+  if (paramMatching && generateParamMatching) {
+    throw new Error(
+      `Page "${page}" cannot export both \`unstable_paramMatching\` and \`unstable_generateParamMatching\`.`
+    )
+  }
+
+  if (hasParamMatching && /\/route\.[^/]+$/.test(pageFilePath)) {
+    throw new Error(
+      `Route "${page}" cannot export parameter matching. It is only supported in layouts and pages.`
+    )
+  }
+
+  if (isEdgeRuntime(config.runtime) && hasParamMatching) {
+    throw new Error(
+      `Page "${page}" cannot use both \`export const runtime = 'edge'\` and parameter matching.`
+    )
+  }
+
+  if (directives?.has('client') && hasParamMatching) {
+    throw new Error(
+      `Page "${page}" cannot use both "use client" and a parameter matching export.`
+    )
+  }
+
+  // Prevent edge runtime and generateStaticParams in the same file.
+  if (isEdgeRuntime(config.runtime) && generateStaticParams) {
+    throw new Error(
+      `Page "${page}" cannot use both \`export const runtime = 'edge'\` and export \`generateStaticParams\`.`
+    )
+  }
+
+  // Prevent use client and generateStaticParams in the same file.
+  if (directives?.has('client') && generateStaticParams) {
+    throw new Error(
+      `Page "${page}" cannot use both "use client" and export function "generateStaticParams()".`
+    )
+  }
+
+  for (const exportName of ['instant', 'prefetch', 'ensureStatic'] as const) {
+    if (exportName in config) {
+      if (directives?.has('client')) {
+        throw new Error(
+          `"${exportName}" is a route segment config and can only be used when the segment is a Server Component module. Remove the "use client" directive from "${pageFilePath}" to use this API.`
+        )
+      }
+
+      if (!nextConfig.cacheComponents) {
+        throw new Error(
+          `Route "${page}" cannot use \`export const ${exportName} = ...\` without enabling \`cacheComponents\`.`
+        )
+      }
+    }
+  }
+
+  // Prevent unstable_dynamicStaleTime in layouts.
+  if ('unstable_dynamicStaleTime' in config) {
+    const isLayout = /\/layout\.[^/]+$/.test(pageFilePath)
+    if (isLayout) {
+      throw new Error(
+        `"${page}" cannot use \`export const unstable_dynamicStaleTime\`. This config is only supported in page files, not layouts.`
+      )
+    }
+  }
+
+  // Prevent combining unstable_dynamicStaleTime and instant.
+  if ('unstable_dynamicStaleTime' in config && 'instant' in config) {
+    throw new Error(
+      `Page "${page}" cannot use both \`export const unstable_dynamicStaleTime\` and \`export const instant\`.`
+    )
+  }
+
+  if (isEdgeRuntime(config.runtime)) {
+    warnAboutEdgeRuntime()
+  }
+
+  if (config.preferredRegion !== undefined) {
+    warnAboutPreferredRegion()
+  }
+
+  return {
+    type: PAGE_TYPES.APP,
+    generateImageMetadata,
+    generateSitemaps,
+    config,
+    middleware: parseMiddlewareConfig(page, exportedConfig.config, nextConfig),
+    runtime: config.runtime,
+    preferredRegion: config.preferredRegion,
+    maxDuration: config.maxDuration,
+    hadUnsupportedValue,
+  }
+}
+
+export async function getPagesPageStaticInfo({
+  pageFilePath,
+  nextConfig,
+  isDev,
+  page,
+}: GetPageStaticInfoParams): Promise<PagesPageStaticInfo> {
+  const content = tryToReadFile(pageFilePath, !isDev)
+  if (!content || !PARSE_PATTERN.test(content)) {
+    return {
+      type: PAGE_TYPES.PAGES,
+      config: undefined,
+      runtime: undefined,
+      preferredRegion: undefined,
+      maxDuration: undefined,
+      hadUnsupportedValue: false,
+    }
+  }
+
+  const ast = await parseModule(pageFilePath, content)
+  validateMiddlewareProxyExports({
+    ast,
+    page,
+    pageFilePath,
+    isDev,
+  })
+
+  const { exports } = checkExports(ast, PagesSegmentConfigSchemaKeys, page)
+
+  const exportedConfig: Record<string, unknown> = {}
+  if (exports) {
+    for (const property of exports) {
+      const result = extractExportedConstValue(ast, property)
+      if (result !== null && 'unsupported' in result) {
+        warnAboutUnsupportedValue(pageFilePath, page, result)
+      } else if (result !== null) {
+        exportedConfig[property] = result.value
+      }
+    }
+  }
+
+  const configResult = extractExportedConstValue(ast, 'config')
+  if (configResult !== null && 'unsupported' in configResult) {
+    warnAboutUnsupportedValue(pageFilePath, page, configResult)
+  } else if (configResult !== null) {
+    exportedConfig.config = configResult.value
+  }
+
+  // Validate the config.
+  const route = normalizePagePath(page)
+  const config = parsePagesSegmentConfig(exportedConfig, route)
+  const isAnAPIRoute = isAPIRoute(route)
+
+  let resolvedRuntime = config.runtime ?? config.config?.runtime
+
+  if (isProxyFile(page) && resolvedRuntime) {
+    const relativePath = relative(process.cwd(), pageFilePath)
+    const resolvedPath = relativePath.startsWith('.')
+      ? relativePath
+      : `./${relativePath}`
+    const message = `Route segment config is not allowed in Proxy file at "${resolvedPath}". Proxy always runs on Node.js runtime. Learn more: https://nextjs.org/docs/messages/middleware-to-proxy`
+
+    if (isDev) {
+      // errorOnce as proxy/middleware runs per request including multiple
+      // internal _next/ routes and spams logs.
+      Log.errorOnce(message)
+      resolvedRuntime = SERVER_RUNTIME.nodejs
+    } else {
+      throw new Error(message)
+    }
+  }
+
+  if (resolvedRuntime === SERVER_RUNTIME.experimentalEdge) {
+    warnAboutExperimentalEdge(isAnAPIRoute ? page! : null)
+  }
+
+  if (
+    !isProxyFile(page) &&
+    resolvedRuntime === SERVER_RUNTIME.edge &&
+    page &&
+    !isAnAPIRoute
+  ) {
+    const message = `Page ${page} provided runtime 'edge', the edge runtime for rendering is currently experimental. Use runtime 'experimental-edge' instead.`
+    if (isDev) {
+      Log.error(message)
+    } else {
+      throw new Error(message)
+    }
+  }
+
+  if (isEdgeRuntime(resolvedRuntime)) {
+    warnAboutEdgeRuntime()
+  }
+
+  if (config.config?.regions !== undefined) {
+    warnAboutPreferredRegion()
+  }
+
+  return {
+    type: PAGE_TYPES.PAGES,
+    config,
+    middleware: parseMiddlewareConfig(page, exportedConfig.config, nextConfig),
+    runtime: resolvedRuntime,
+    preferredRegion: config.config?.regions,
+    maxDuration: config.maxDuration ?? config.config?.maxDuration,
+    hadUnsupportedValue,
+  }
 }
 
 /**
@@ -336,123 +923,12 @@ function warnAboutUnsupportedValue(
  * to be specified, that is, when gSSP or gSP is used.
  * Related discussion: https://github.com/vercel/next.js/discussions/34179
  */
-export async function getPageStaticInfo(params: {
-  pageFilePath: string
-  nextConfig: Partial<NextConfig>
-  isDev?: boolean
-  page?: string
-  pageType: 'pages' | 'app' | 'root'
-}): Promise<PageStaticInfo> {
-  const { isDev, pageFilePath, nextConfig, page, pageType } = params
-
-  const fileContent = (await tryToReadFile(pageFilePath, !isDev)) || ''
-  if (
-    /runtime|preferredRegion|getStaticProps|getServerSideProps|export const config/.test(
-      fileContent
-    )
-  ) {
-    const swcAST = await parseModule(pageFilePath, fileContent)
-    const { ssg, ssr, runtime, preferredRegion } = checkExports(swcAST)
-    const rsc = getRSCModuleInformation(fileContent).type
-
-    // default / failsafe value for config
-    let config: any
-    try {
-      config = extractExportedConstValue(swcAST, 'config')
-    } catch (e) {
-      if (e instanceof UnsupportedValueError) {
-        warnAboutUnsupportedValue(pageFilePath, page, e)
-      }
-      // `export config` doesn't exist, or other unknown error throw by swc, silence them
-    }
-    if (pageType === 'app') {
-      if (config) {
-        const message = `\`export const config\` in ${pageFilePath} is deprecated. Please change \`runtime\` property to segment export config. See https://beta.nextjs.org/docs/api-reference/segment-config`
-        if (isDev) {
-          Log.warnOnce(message)
-        } else {
-          throw new Error(message)
-        }
-        config = {}
-      }
-    }
-    if (!config) config = {}
-
-    // We use `export const config = { runtime: '...' }` to specify the page runtime for pages/.
-    // In the new app directory, we prefer to use `export const runtime = '...'`
-    // and deprecate the old way. To prevent breaking changes for `pages`, we use the exported config
-    // as the fallback value.
-    let resolvedRuntime
-    if (pageType === 'app') {
-      resolvedRuntime = runtime
-    } else {
-      resolvedRuntime = runtime || config.runtime
-    }
-
-    if (
-      typeof resolvedRuntime !== 'undefined' &&
-      resolvedRuntime !== SERVER_RUNTIME.nodejs &&
-      !isEdgeRuntime(resolvedRuntime)
-    ) {
-      const options = Object.values(SERVER_RUNTIME).join(', ')
-      const message =
-        typeof resolvedRuntime !== 'string'
-          ? `The \`runtime\` config must be a string. Please leave it empty or choose one of: ${options}`
-          : `Provided runtime "${resolvedRuntime}" is not supported. Please leave it empty or choose one of: ${options}`
-      if (isDev) {
-        Log.error(message)
-      } else {
-        throw new Error(message)
-      }
-    }
-
-    const requiresServerRuntime = ssr || ssg || pageType === 'app'
-
-    const isAnAPIRoute = isAPIRoute(page?.replace(/^(?:\/src)?\/pages\//, '/'))
-
-    resolvedRuntime =
-      isEdgeRuntime(resolvedRuntime) || requiresServerRuntime
-        ? resolvedRuntime
-        : undefined
-
-    if (resolvedRuntime === SERVER_RUNTIME.experimentalEdge) {
-      warnAboutExperimentalEdge(isAnAPIRoute ? page! : null)
-    }
-
-    if (
-      resolvedRuntime === SERVER_RUNTIME.edge &&
-      pageType === 'pages' &&
-      page &&
-      !isAnAPIRoute
-    ) {
-      const message = `Page ${page} provided runtime 'edge', the edge runtime for rendering is currently experimental. Use runtime 'experimental-edge' instead.`
-      if (isDev) {
-        Log.error(message)
-      } else {
-        throw new Error(message)
-      }
-    }
-
-    const middlewareConfig = getMiddlewareConfig(
-      page ?? 'middleware/edge API route',
-      config,
-      nextConfig
-    )
-
-    return {
-      ssr,
-      ssg,
-      rsc,
-      ...(middlewareConfig && { middleware: middlewareConfig }),
-      ...(resolvedRuntime && { runtime: resolvedRuntime }),
-      preferredRegion,
-    }
+export async function getPageStaticInfo(
+  params: GetPageStaticInfoParams
+): Promise<PageStaticInfo> {
+  if (params.pageType === PAGE_TYPES.APP) {
+    return getAppPageStaticInfo(params)
   }
 
-  return {
-    ssr: false,
-    ssg: false,
-    rsc: RSC_MODULE_TYPES.server,
-    runtime: undefined,
-  }
+  return getPagesPageStaticInfo(params)
 }

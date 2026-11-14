@@ -1,3 +1,5 @@
+import type { Element as CheerioElement, Node as CheerioNode } from 'cheerio'
+
 import fs from 'fs'
 import path from 'path'
 import execa from 'execa'
@@ -196,11 +198,14 @@ class CraTransform {
     const documentPage = path.join(this.pagesDir, `_document.${pageExt}`)
     const catchAllPage = path.join(this.pagesDir, `[[...slug]].${pageExt}`)
 
-    const gatherTextChildren = (children: CheerioElement[]) => {
+    const gatherTextChildren = (children: CheerioNode[]) => {
       return children
         .map((child) => {
           if (child.type === 'text') {
-            return child.data
+            // `data` only exists on Data nodes according to types so this is sus.
+            // @ts-expect-error - Found when upgrading to TypeScript 6.0.
+            const text = child.data
+            return text
           }
           return ''
         })
@@ -428,31 +433,34 @@ export default function Page(props) {
         JSON.stringify(
           {
             ...this.packageJsonData,
-            scripts: Object.keys(scripts).reduce((prev, cur) => {
-              const command = scripts[cur]
-              prev[cur] = command
+            scripts: Object.keys(scripts).reduce(
+              (prev, cur) => {
+                const command = scripts[cur]
+                prev[cur] = command
 
-              if (command === packageName) {
-                prev[cur] = 'next dev'
-              }
+                if (command === packageName) {
+                  prev[cur] = 'next dev'
+                }
 
-              if (command.includes(`${packageName} `)) {
-                prev[cur] = command.replace(
-                  `${packageName} `,
-                  command.includes(`${packageName} test`) ? 'jest ' : 'next '
-                )
-              }
-              if (cur === 'eject') {
-                prev[cur] = undefined
-              }
-              // TODO: do we want to map start -> next start instead of CRA's
-              // default of mapping starting to dev mode?
-              if (cur === 'start') {
-                prev[cur] = prev[cur].replace('next start', 'next dev')
-                prev['start-production'] = 'next start'
-              }
-              return prev
-            }, {} as { [key: string]: string }),
+                if (command.includes(`${packageName} `)) {
+                  prev[cur] = command.replace(
+                    `${packageName} `,
+                    command.includes(`${packageName} test`) ? 'jest ' : 'next '
+                  )
+                }
+                if (cur === 'eject') {
+                  prev[cur] = undefined
+                }
+                // TODO: do we want to map start -> next start instead of CRA's
+                // default of mapping starting to dev mode?
+                if (cur === 'start') {
+                  prev[cur] = prev[cur].replace('next start', 'next dev')
+                  prev['start-production'] = 'next start'
+                }
+                return prev
+              },
+              {} as { [key: string]: string }
+            ),
             dependencies: {
               ...dependencies,
               ...packagesToRemove,

@@ -3,6 +3,9 @@
     "attacks",
     "color",
     "dead",
+    "deno",
+    "digitalocean",
+    "dirty",
     "execute",
     "executed",
     "executes",
@@ -13,12 +16,18 @@
     "failures",
     "fire",
     "fires",
+    "flightcontrol",
+    "fly.io",
+    "github",
     "hook",
     "hooks",
     "host-hostess",
     "invalid",
+    "railway",
     "remains",
+    "simple",
     "special",
+    "sst",
     "white"
   ]
 }

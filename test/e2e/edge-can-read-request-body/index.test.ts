@@ -1,7 +1,5 @@
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 import { fetchViaHTTP, renderViaHTTP } from 'next-test-utils'
-import FormData from 'form-data'
 import path from 'path'
 
 async function serialize(response: Response) {
@@ -13,15 +11,10 @@ async function serialize(response: Response) {
 }
 
 describe('Edge can read request body', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files: new FileRef(path.resolve(__dirname, './app')),
-      dependencies: {},
-    })
+  const { next } = nextTestSetup({
+    files: new FileRef(path.resolve(__dirname, './app')),
+    dependencies: {},
   })
-  afterAll(() => next.destroy())
 
   it('renders the static page', async () => {
     const html = await renderViaHTTP(next.url, '/api/nothing')
@@ -101,14 +94,9 @@ describe('Edge can read request body', () => {
       const formData = new FormData()
       formData.append('hello', 'world')
 
-      const response = await fetchViaHTTP(
-        next.url,
-        '/api/nothing?middleware-handler=formData',
-        null,
-        {
-          method: 'POST',
-          body: formData,
-        }
+      const response: Response = await fetch(
+        new URL(next.url + '/api/nothing?middleware-handler=formData'),
+        { method: 'POST', body: formData }
       )
 
       expect(await serialize(response)).toMatchObject({

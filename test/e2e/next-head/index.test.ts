@@ -1,30 +1,18 @@
-import { createNext, FileRef } from 'e2e-utils'
+import { FileRef, nextTestSetup, isNextDev } from 'e2e-utils'
 import { renderViaHTTP } from 'next-test-utils'
 import cheerio from 'cheerio'
-import webdriver from 'next-webdriver'
-import { NextInstance } from 'test/lib/next-modes/base'
 import { join } from 'path'
 
-describe('should set-up next', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files: {
-        pages: new FileRef(join(__dirname, 'app/pages')),
-        components: new FileRef(join(__dirname, 'app/components')),
-      },
-      nextConfig: {
-        experimental: {
-          strictNextHead: true,
-        },
-      },
-    })
+describe('next/head', () => {
+  const { next } = nextTestSetup({
+    files: {
+      pages: new FileRef(join(__dirname, 'app/pages')),
+      components: new FileRef(join(__dirname, 'app/components')),
+    },
   })
-  afterAll(() => next.destroy())
 
   it(`should place charset element at the top of <head>`, async () => {
-    const browser = await webdriver(next.url, '/')
+    const browser = await next.browser('/')
 
     const html = await browser.eval(() => {
       const head = document.querySelector('head')
@@ -32,7 +20,7 @@ describe('should set-up next', () => {
     })
 
     expect(html).toContain(
-      `<meta charset="utf-8"><meta name="next-head" content="1"><meta name="viewport" content="width=device-width"><meta name="next-head" content="1"><meta name="test-head-1" content="hello">`
+      `<meta charset="utf-8" data-next-head=""><meta name="viewport" content="width=device-width" data-next-head=""><meta name="test-head-1" content="hello" data-next-head="">`
     )
   })
 
@@ -53,7 +41,7 @@ describe('should set-up next', () => {
   })
 
   it('should have correct head tags after hydration', async () => {
-    const browser = await webdriver(next.url, '/')
+    const browser = await next.browser('/')
 
     for (let i = 1; i < 5; i++) {
       expect(
@@ -70,6 +58,33 @@ describe('should set-up next', () => {
 
     expect($(`meta[name="test-head-initial-props"]`).attr()['content']).toBe(
       'hello'
+    )
+  })
+})
+
+describe('next/head dev route discovery', () => {
+  if (!isNextDev) {
+    return
+  }
+
+  const { next } = nextTestSetup({
+    files: {
+      pages: new FileRef(join(__dirname, 'app/pages')),
+      components: new FileRef(join(__dirname, 'app/components')),
+      'inject-readdir-delay.cjs': new FileRef(
+        join(__dirname, 'app/inject-readdir-delay.cjs')
+      ),
+    },
+    env: { NODE_OPTIONS: '--require ./inject-readdir-delay.cjs' },
+  })
+
+  it('waits for the initial route scan before serving pages', async () => {
+    const response = await next.fetch('/')
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('index page')
+    expect(next.cliOutput).toContain(
+      '[next-head] delaying initial Watchpack pages scan'
     )
   })
 })

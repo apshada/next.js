@@ -13,6 +13,10 @@ module.exports = {
       ],
       afterFiles: [
         {
+          source: '/article/:slug*',
+          destination: '/detail/:slug*',
+        },
+        {
           source: '/afterfiles-rewrite',
           destination: '/ab-test/b',
         },
@@ -23,6 +27,11 @@ module.exports = {
         {
           source: '/config-rewrite-to-dynamic-static/:rewriteSlug',
           destination: '/ssg',
+        },
+        {
+          source: '/external-rewrite-body',
+          destination:
+            'https://next-data-api-endpoint.vercel.app/api/echo-body',
         },
       ],
       fallback: [],

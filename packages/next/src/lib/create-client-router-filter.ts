@@ -1,16 +1,19 @@
-import { Token } from 'next/dist/compiled/path-to-regexp'
+import type { Token } from 'next/dist/compiled/path-to-regexp'
 import { BloomFilter } from '../shared/lib/bloom-filter'
 import { isDynamicRoute } from '../shared/lib/router/utils'
 import { removeTrailingSlash } from '../shared/lib/router/utils/remove-trailing-slash'
-import { Redirect } from './load-custom-routes'
+import type { Redirect } from './load-custom-routes'
 import { tryToParsePath } from './try-to-parse-path'
-
-const POTENTIAL_ERROR_RATE = 0.01
+import {
+  extractInterceptionRouteInformation,
+  isInterceptionRouteAppPath,
+} from '../shared/lib/router/utils/interception-routes'
+import { DYNAMIC_FILTER_PLACEHOLDER } from '../shared/lib/router/utils/dynamic-filter-pattern'
 
 export function createClientRouterFilter(
   paths: string[],
   redirects: Redirect[],
-  allowedErrorRate: number = POTENTIAL_ERROR_RATE
+  allowedErrorRate?: number
 ): {
   staticFilter: ReturnType<BloomFilter['export']>
   dynamicFilter: ReturnType<BloomFilter['export']>
@@ -18,14 +21,18 @@ export function createClientRouterFilter(
   const staticPaths = new Set<string>()
   const dynamicPaths = new Set<string>()
 
-  for (const path of paths) {
+  for (let path of paths) {
     if (isDynamicRoute(path)) {
+      if (isInterceptionRouteAppPath(path)) {
+        path = extractInterceptionRouteInformation(path).interceptedRoute
+      }
+
       let subPath = ''
       const pathParts = path.split('/')
 
       // start at 1 since we split on '/' and the path starts
       // with this so the first entry is an empty string
-      for (let i = 1; i < pathParts.length + 1; i++) {
+      for (let i = 1; i < pathParts.length; i++) {
         const curPart = pathParts[i]
 
         if (curPart.startsWith('[')) {
@@ -36,6 +43,13 @@ export function createClientRouterFilter(
 
       if (subPath) {
         dynamicPaths.add(subPath)
+      } else {
+        // The route begins with a dynamic segment, so it has no static
+        // prefix to anchor the prefix-based dynamic filter on (e.g.
+        // `/[locale]/about`). Store its normalized pattern instead so the
+        // client can still detect it when a pages dynamic route would
+        // otherwise shadow it.
+        dynamicPaths.add(normalizeRouteToFilterPattern(path))
       }
     } else {
       staticPaths.add(path)
@@ -49,7 +63,7 @@ export function createClientRouterFilter(
 
     try {
       tokens = tryToParsePath(source).tokens || []
-    } catch (_) {}
+    } catch {}
 
     if (tokens.every((token) => typeof token === 'string')) {
       // only include static redirects initially
@@ -65,4 +79,19 @@ export function createClientRouterFilter(
     dynamicFilter: dynamicFilter.export(),
   }
   return data
+}
+
+/**
+ * Replace every dynamic segment of a route with the placeholder token, e.g.
+ * `/[locale]/about` -> `/[]/about`, `/[lang]` -> `/[]`. This is the encode half
+ * of the dynamic filter; the pages router decodes it with
+ * `hasDynamicFilterCandidate`, and both rely on `DYNAMIC_FILTER_PLACEHOLDER`.
+ */
+function normalizeRouteToFilterPattern(route: string): string {
+  return route
+    .split('/')
+    .map((segment) =>
+      segment.startsWith('[') ? DYNAMIC_FILTER_PLACEHOLDER : segment
+    )
+    .join('/')
 }

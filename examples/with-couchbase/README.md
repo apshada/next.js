@@ -10,8 +10,6 @@ If you want to learn more about Couchbase, visit the following pages:
 
 ## Deploy your own
 
-Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_medium=readme&utm_campaign=next-example) once you have access to the environment variables you'll need or preview live with [StackBlitz](https://stackblitz.com/github/vercel/next.js/tree/canary/examples/with-couchbase)
-
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vercel/next.js/tree/canary/examples/with-couchbase&project-name=with-couchbase&repository-name=with-couchbase&env=COUCHBASE_USER,COUCHBASE_PASSWORD,COUCHBASE_ENDPOINT,COUCHBASE_BUCKET,IS_CLOUD_INSTANCE&envDescription=Required%20to%20connect%20the%20app%20with%20Couchbase)
 
 ## How to use
@@ -91,5 +89,4 @@ To deploy your local project to Vercel, push it to GitHub/GitLab/Bitbucket and [
 - When you import your project on Vercel, make sure to click on **Environment Variables** and set the keys to match your `.env.local` file.
 
 - For a cloud deployment on Vercel, the **Environment Variables** values will need to **correspond to a cloud instance of Couchbase** (localhost will **NOT** connect from a remote server such as Vercel). Find info on [getting started with Couchbase cloud](https://developer.couchbase.com/tutorial-cloud-getting-started/).
-
   - _Important:_ you will have to allowlist 0.0.0.0/0 as the IP address, since Vercel's serverless deployments use [dynamic IP addresses](https://vercel.com/docs/solutions/databases#allowing-&-blocking-ip-addresses)

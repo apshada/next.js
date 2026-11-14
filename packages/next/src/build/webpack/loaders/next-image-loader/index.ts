@@ -1,22 +1,33 @@
+import type { CompilerNameValues } from '../../../../shared/lib/constants'
+
+import path from 'path'
 import loaderUtils from 'next/dist/compiled/loader-utils3'
-import { getImageSize } from '../../../../server/image-optimizer'
+import { getImageSize } from '../../../../server/image-optimizer/get-image-size'
 import { getBlurImage } from './blur'
 
 interface Options {
-  isServer: boolean
+  compilerType: CompilerNameValues
   isDev: boolean
   assetPrefix: string
   basePath: string
+  outputHashSalt: string
 }
 
 function nextImageLoader(this: any, content: Buffer) {
   const imageLoaderSpan = this.currentTraceSpan.traceChild('next-image-loader')
   return imageLoaderSpan.traceAsyncFn(async () => {
     const options: Options = this.getOptions()
-    const { isServer, isDev, assetPrefix, basePath } = options
+    const { compilerType, isDev, assetPrefix, basePath, outputHashSalt } =
+      options
     const context = this.rootContext
 
-    const opts = { context, content }
+    // Prepend the hash salt to the content for filename hash computation, so
+    // that NEXT_HASH_SALT causes image filenames to change (like it does for
+    // chunks). The actual file content is unaffected.
+    const contentForHash = outputHashSalt
+      ? Buffer.concat([Buffer.from(outputHashSalt, 'utf8'), content])
+      : content
+    const opts = { context, content: contentForHash }
     const interpolatedName = loaderUtils.interpolateName(
       this,
       '/static/media/[name].[hash:8].[ext]',
@@ -30,7 +41,7 @@ function nextImageLoader(this: any, content: Buffer) {
 
     const imageSizeSpan = imageLoaderSpan.traceChild('image-size-calculation')
     const imageSize = await imageSizeSpan.traceAsyncFn(() =>
-      getImageSize(content, extension).catch((err) => err)
+      getImageSize(content).catch((err) => err)
     )
 
     if (imageSize instanceof Error) {
@@ -63,14 +74,18 @@ function nextImageLoader(this: any, content: Buffer) {
         })
       )
 
-    if (isServer) {
+    if (compilerType === 'client') {
+      this.emitFile(interpolatedName, content, null)
+    } else {
       this.emitFile(
-        `../${isDev ? '' : '../'}${interpolatedName}`,
+        path.join(
+          '..',
+          isDev || compilerType === 'edge-server' ? '' : '..',
+          interpolatedName
+        ),
         content,
         null
       )
-    } else {
-      this.emitFile(interpolatedName, content, null)
     }
 
     return `export default ${stringifiedData};`

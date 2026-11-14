@@ -1,118 +1,87 @@
 /* eslint-env jest */
-import { sandbox } from './helpers'
-import { createNextDescribe, FileRef } from 'e2e-utils'
+import { createSandbox } from 'development-sandbox'
+import { FileRef, nextTestSetup, type Playwright } from 'e2e-utils'
+import { retry } from 'next-test-utils'
 import path from 'path'
+import { outdent } from 'outdent'
 
-createNextDescribe(
-  'Error Overlay version staleness',
-  {
-    files: new FileRef(path.join(__dirname, 'fixtures', 'default-template')),
-    dependencies: {
-      react: 'latest',
-      'react-dom': 'latest',
-    },
+const bundlerName = process.env.IS_TURBOPACK_TEST
+  ? 'Turbopack'
+  : process.env.NEXT_RSPACK
+    ? 'Rspack'
+    : 'Webpack'
+
+describe('Error Overlay version staleness', () => {
+  // The fixture's next.config.js mocks the package registry with a newer major
+  // version, so the installed version is always reported as outdated.
+  const { next } = nextTestSetup({
+    files: new FileRef(path.join(__dirname, 'fixtures', 'version-staleness')),
     skipStart: true,
-  },
-  ({ next }) => {
-    it('should show version staleness in runtime error', async () => {
-      // Set next to outdated version
-      const nextPackageJson = JSON.parse(
-        await next.readFile('node_modules/next/package.json')
-      )
-      nextPackageJson.version = '1.0.0'
+  })
 
-      const { browser, session, cleanup } = await sandbox(
-        next,
-        new Map([
-          ['node_modules/next/package.json', JSON.stringify(nextPackageJson)],
-        ])
-      )
-
-      await session.patch(
-        'app/page.js',
-        `
-        "use client"
-      import Component from '../index'
-      export default function Page() {
-        setTimeout(() => {
-            throw new Error("runtime error")
-        }, 0)
-        return null
-      }
-      `
-      )
-
-      await session.waitForAndOpenRuntimeError()
+  async function expectOutdatedStaleness(browser: Playwright) {
+    const { version } = JSON.parse(
+      await next.readFile('node_modules/next/package.json')
+    )
+    // The registry lookup is not awaited before the overlay is shown, so the
+    // staleness can arrive after the installed version is already displayed.
+    await retry(async () => {
       expect(
         await browser
           .waitForElementByCss('.nextjs-container-build-error-version-status')
           .text()
-      ).toMatchInlineSnapshot(`"Next.js (1.0.0) is outdated (learn more)"`)
-
-      await cleanup()
-    })
-
-    it('should show version staleness in render error', async () => {
-      // Set next to outdated version
-      const nextPackageJson = JSON.parse(
-        await next.readFile('node_modules/next/package.json')
-      )
-      nextPackageJson.version = '2.0.0'
-
-      const { browser, session, cleanup } = await sandbox(
-        next,
-        new Map([
-          ['node_modules/next/package.json', JSON.stringify(nextPackageJson)],
-        ])
-      )
-
-      await session.patch(
-        'app/page.js',
-        `
-      export default function Page() {
-        throw new Error("render error")
-        return null
-      }
-      `
-      )
-
-      expect(
-        await browser
-          .waitForElementByCss('.nextjs-container-build-error-version-status')
-          .text()
-      ).toMatchInlineSnapshot(`"Next.js (2.0.0) is outdated (learn more)"`)
-
-      await cleanup()
-    })
-
-    it('should show version staleness in build error', async () => {
-      // Set next to outdated version
-      const nextPackageJson = JSON.parse(
-        await next.readFile('node_modules/next/package.json')
-      )
-      nextPackageJson.version = '3.0.0'
-
-      const { browser, session, cleanup } = await sandbox(
-        next,
-        new Map([
-          ['node_modules/next/package.json', JSON.stringify(nextPackageJson)],
-        ])
-      )
-
-      await session.patch(
-        'app/page.js',
-        `
-        {{{
-      `
-      )
-
-      expect(
-        await browser
-          .waitForElementByCss('.nextjs-container-build-error-version-status')
-          .text()
-      ).toMatchInlineSnapshot(`"Next.js (3.0.0) is outdated (learn more)"`)
-
-      await cleanup()
+      ).toBe(`Next.js ${version} (outdated)\n${bundlerName}`)
     })
   }
-)
+
+  it('should show version staleness in runtime error', async () => {
+    await using sandbox = await createSandbox(next)
+    const { session, browser } = sandbox
+    await session.patch(
+      'app/page.js',
+      outdent`
+        "use client"
+        import Component from '../index'
+        export default function Page() {
+          setTimeout(() => {
+              throw new Error("runtime error")
+          }, 0)
+          return null
+        }
+      `
+    )
+
+    await session.openRedbox()
+
+    await expectOutdatedStaleness(browser)
+  })
+
+  it('should show version staleness in render error', async () => {
+    await using sandbox = await createSandbox(next)
+    const { session, browser } = sandbox
+    await session.patch(
+      'app/page.js',
+      outdent`
+        export default function Page() {
+          throw new Error("render error")
+          return null
+        }
+      `
+    )
+
+    await expectOutdatedStaleness(browser)
+  })
+
+  it('should show version staleness in build error', async () => {
+    await using sandbox = await createSandbox(next)
+    const { session, browser } = sandbox
+    await session.patch(
+      'app/page.js',
+      outdent`
+        {{{
+      `
+    )
+
+    await expectOutdatedStaleness(browser)
+  })
+})

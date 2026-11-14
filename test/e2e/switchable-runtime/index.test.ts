@@ -1,11 +1,6 @@
 /* eslint-env jest */
-import webdriver from 'next-webdriver'
-import { join } from 'path'
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { FileRef, nextTestSetup, isNextDev } from 'e2e-utils'
 import { check, fetchViaHTTP, renderViaHTTP, waitFor } from 'next-test-utils'
-
-import { readJson } from 'fs-extra'
 
 function splitLines(text) {
   return text
@@ -34,23 +29,13 @@ async function testRoute(appPort, url, { isStatic, isEdge }) {
 }
 
 describe('Switchable runtime', () => {
-  let next: NextInstance
   let context
 
-  if ((global as any).isNextDeploy) {
-    // TODO-APP: re-enable after Prerenders are handled on deploy
-    it('should skip for deploy temporarily', () => {})
-    return
-  }
+  const { next } = nextTestSetup({
+    files: new FileRef(__dirname),
+  })
 
-  beforeAll(async () => {
-    next = await createNext({
-      files: new FileRef(__dirname),
-      dependencies: {
-        react: 'latest',
-        'react-dom': 'latest',
-      },
-    })
+  beforeAll(() => {
     context = {
       appPort: next.url,
       appDir: next.testDir,
@@ -58,9 +43,8 @@ describe('Switchable runtime', () => {
       stderr: '',
     }
   })
-  afterAll(() => next.destroy())
 
-  if ((global as any).isNextDev) {
+  if (isNextDev) {
     describe('Switchable runtime (dev)', () => {
       it('should not include edge api routes and edge ssr routes into dev middleware manifest', async () => {
         const res = await fetchViaHTTP(
@@ -86,7 +70,7 @@ describe('Switchable runtime', () => {
         // /edge/foo should be caught before /edge/[id]
         expect(html).toContain(`to /edge/[id]`)
 
-        const browser = await webdriver(context.appPort, '/edge/foo')
+        const browser = await next.browser('/edge/foo')
 
         await browser.waitForElementByCss('a').click()
 
@@ -111,14 +95,13 @@ describe('Switchable runtime', () => {
       it.skip('should support client side navigation to ssr rsc pages', async () => {
         let flightRequest = null
 
-        const browser = await webdriver(context.appPort, '/node', {
+        const browser = await next.browser('/node', {
           beforePageLoad(page) {
             page.on('request', (request) => {
-              return request.allHeaders().then((headers) => {
-                if (headers['RSC'.toLowerCase()] === '1') {
-                  flightRequest = request.url()
-                }
-              })
+              const headers = request.headers()
+              if (headers['rsc'] === '1') {
+                flightRequest = request.url()
+              }
             })
           },
         })
@@ -136,7 +119,7 @@ describe('Switchable runtime', () => {
       })
 
       it.skip('should support client side navigation to ssg rsc pages', async () => {
-        const browser = await webdriver(context.appPort, '/node')
+        const browser = await next.browser('/node')
 
         await browser
           .waitForElementByCss('#link-node-rsc-ssg')
@@ -150,7 +133,7 @@ describe('Switchable runtime', () => {
       })
 
       it.skip('should support client side navigation to static rsc pages', async () => {
-        const browser = await webdriver(context.appPort, '/node')
+        const browser = await next.browser('/node')
 
         await browser
           .waitForElementByCss('#link-node-rsc')
@@ -179,42 +162,6 @@ describe('Switchable runtime', () => {
         response = await fetchViaHTTP(context.appPort, '/api/edge')
         text = await response.text()
         expect(text).toMatch(/Returned by Edge API Route .+\/api\/edge/)
-
-        if (!(global as any).isNextDeploy) {
-          const manifest = await readJson(
-            join(context.appDir, '.next/server/middleware-manifest.json')
-          )
-          expect(manifest).toMatchObject({
-            functions: {
-              '/api/hello': {
-                env: expect.arrayContaining([]),
-                files: [
-                  'server/edge-runtime-webpack.js',
-                  'server/pages/api/hello.js',
-                ],
-                name: 'pages/api/hello',
-                page: '/api/hello',
-                matchers: [
-                  { regexp: '^/api/hello$', originalSource: '/api/hello' },
-                ],
-                wasm: [],
-              },
-              '/api/edge': {
-                env: expect.arrayContaining([]),
-                files: [
-                  'server/edge-runtime-webpack.js',
-                  'server/pages/api/edge.js',
-                ],
-                name: 'pages/api/edge',
-                page: '/api/edge',
-                matchers: [
-                  { regexp: '^/api/edge$', originalSource: '/api/edge' },
-                ],
-                wasm: [],
-              },
-            },
-          })
-        }
       })
 
       it('should be possible to switch between runtimes in API routes', async () => {
@@ -426,7 +373,7 @@ describe('Switchable runtime', () => {
           /Hello from page with invalid type/
         )
         expect(next.cliOutput).toInclude(
-          'error - The `runtime` config must be a string. Please leave it empty or choose one of:'
+          'The `runtime` config must be a string. Please leave it empty or choose one of:'
         )
 
         // Invalid runtime
@@ -447,7 +394,7 @@ describe('Switchable runtime', () => {
           /Hello from page with invalid runtime/
         )
         expect(next.cliOutput).toInclude(
-          'error - Provided runtime "asd" is not supported. Please leave it empty or choose one of:'
+          'Provided runtime "asd" is not supported. Please leave it empty or choose one of:'
         )
 
         // Fix the runtime
@@ -486,7 +433,7 @@ describe('Switchable runtime', () => {
           /Hello from app/
         )
         expect(next.cliOutput).toInclude(
-          'error - Provided runtime "invalid-runtime" is not supported. Please leave it empty or choose one of:'
+          'Provided runtime "invalid-runtime" is not supported. Please leave it empty or choose one of:'
         )
 
         await next.patchFile(
@@ -615,42 +562,6 @@ describe('Switchable runtime', () => {
         response = await fetchViaHTTP(context.appPort, 'rewrite/api/edge')
         text = await response.text()
         expect(text).toMatch(/Returned by Edge API Route .+\/api\/edge/)
-
-        if (!(global as any).isNextDeploy) {
-          const manifest = await readJson(
-            join(context.appDir, '.next/server/middleware-manifest.json')
-          )
-          expect(manifest).toMatchObject({
-            functions: {
-              '/api/hello': {
-                env: expect.arrayContaining([]),
-                files: [
-                  'server/edge-runtime-webpack.js',
-                  'server/pages/api/hello.js',
-                ],
-                name: 'pages/api/hello',
-                page: '/api/hello',
-                matchers: [
-                  { regexp: '^/api/hello$', originalSource: '/api/hello' },
-                ],
-                wasm: [],
-              },
-              '/api/edge': {
-                env: expect.arrayContaining([]),
-                files: [
-                  'server/edge-runtime-webpack.js',
-                  'server/pages/api/edge.js',
-                ],
-                name: 'pages/api/edge',
-                page: '/api/edge',
-                matchers: [
-                  { regexp: '^/api/edge$', originalSource: '/api/edge' },
-                ],
-                wasm: [],
-              },
-            },
-          })
-        }
       })
 
       it.skip('should display correct tree view with page types in terminal', async () => {
@@ -660,17 +571,17 @@ describe('Switchable runtime', () => {
         const expectedOutputLines = splitLines(`
       ┌   /_app
       ├ ○ /404
-      ├ ℇ /api/hello
-      ├ λ /api/node
-      ├ ℇ /edge
-      ├ ℇ /edge-rsc
+      ├ ƒ /api/hello
+      ├ ƒ /api/node
+      ├ ƒ /edge
+      ├ ƒ /edge-rsc
       ├ ○ /node
       ├ ● /node-rsc
       ├ ● /node-rsc-isr
       ├ ● /node-rsc-ssg
-      ├ λ /node-rsc-ssr
+      ├ ƒ /node-rsc-ssr
       ├ ● /node-ssg
-      ├ λ /node-ssr
+      ├ ƒ /node-ssr
       └ ○ /static
       `)
 
@@ -689,7 +600,7 @@ describe('Switchable runtime', () => {
       it.skip('should prefetch data for static pages', async () => {
         const dataRequests = []
 
-        const browser = await webdriver(context.appPort, '/node', {
+        const browser = await next.browser('/node', {
           beforePageLoad(page) {
             page.on('request', (request) => {
               const url = request.url()
@@ -715,14 +626,13 @@ describe('Switchable runtime', () => {
       it.skip('should support client side navigation to ssr rsc pages', async () => {
         let flightRequest = null
 
-        const browser = await webdriver(context.appPort, '/node', {
+        const browser = await next.browser('/node', {
           beforePageLoad(page) {
             page.on('request', (request) => {
-              request.allHeaders().then((headers) => {
-                if (headers['RSC'.toLowerCase()] === '1') {
-                  flightRequest = request.url()
-                }
-              })
+              const headers = request.headers()
+              if (headers['rsc'] === '1') {
+                flightRequest = request.url()
+              }
             })
           },
         })
@@ -736,7 +646,7 @@ describe('Switchable runtime', () => {
       })
 
       it.skip('should support client side navigation to ssg rsc pages', async () => {
-        const browser = await webdriver(context.appPort, '/node')
+        const browser = await next.browser('/node')
 
         await browser.waitForElementByCss('#link-node-rsc-ssg').click()
         expect(await browser.elementByCss('body').text()).toContain(
@@ -745,7 +655,7 @@ describe('Switchable runtime', () => {
       })
 
       it.skip('should support client side navigation to static rsc pages', async () => {
-        const browser = await webdriver(context.appPort, '/node')
+        const browser = await next.browser('/node')
 
         await browser.waitForElementByCss('#link-node-rsc').click()
         expect(await browser.elementByCss('body').text()).toContain(

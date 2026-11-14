@@ -8,6 +8,10 @@ const PUBLIC_FILE = /\.(.*)$/
 export async function middleware(request) {
   const url = request.nextUrl
 
+  if (url.pathname.includes('article')) {
+    return NextResponse.next()
+  }
+
   // this is needed for tests to get the BUILD_ID
   if (url.pathname.startsWith('/_next/static/__BUILD_ID')) {
     return NextResponse.next()
@@ -17,6 +21,58 @@ export async function middleware(request) {
     return NextResponse.next({
       'x-matched-path': '/404',
     })
+  }
+
+  if (
+    url.pathname.includes(
+      '/middleware-external-rewrite-body-headers-return-body'
+    )
+  ) {
+    const tmpHeaders = new Headers(request.headers)
+
+    tmpHeaders.set('x-hello-from-middleware1', 'hello')
+
+    return NextResponse.rewrite(
+      'https://next-data-api-endpoint.vercel.app/api/echo-body',
+      {
+        request: {
+          headers: tmpHeaders,
+        },
+      }
+    )
+  }
+
+  if (
+    url.pathname.includes(
+      '/middleware-external-rewrite-body-headers-return-headers'
+    )
+  ) {
+    const tmpHeaders = new Headers(request.headers)
+
+    tmpHeaders.set('x-hello-from-middleware1', 'hello')
+
+    return NextResponse.rewrite(
+      'https://next-data-api-endpoint.vercel.app/api/echo-headers',
+      {
+        request: {
+          headers: tmpHeaders,
+        },
+      }
+    )
+  }
+
+  if (url.pathname.includes('/middleware-external-rewrite-body')) {
+    return NextResponse.rewrite(
+      'https://next-data-api-endpoint.vercel.app/api/echo-body'
+    )
+  }
+
+  if (url.pathname === '/foo/bar') {
+    const rewriteUrl = request.nextUrl.clone()
+    rewriteUrl.pathname = '/api/proxy/bar/'
+    rewriteUrl.searchParams.set('added', '1')
+    rewriteUrl.searchParams.set('extra', '2')
+    return NextResponse.rewrite(rewriteUrl)
   }
 
   if (url.pathname.includes('/rewrite-to-static')) {
@@ -97,6 +153,19 @@ export async function middleware(request) {
       }
     }
     return NextResponse.rewrite(url)
+  }
+
+  if (url.pathname === '/dynamic-no-cache/1') {
+    const rewriteUrl =
+      request.headers.get('purpose') === 'prefetch'
+        ? '/dynamic-no-cache/1'
+        : '/dynamic-no-cache/2'
+
+    url.pathname = rewriteUrl
+
+    return NextResponse.rewrite(url, {
+      headers: { 'x-middleware-cache': 'no-cache' },
+    })
   }
 
   if (

@@ -1,29 +1,24 @@
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
-import { renderViaHTTP } from 'next-test-utils'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 import { join } from 'path'
 
 describe('fallback export error', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files: {
-        pages: new FileRef(join(__dirname, 'pages')),
-      },
-    })
+  const { next } = nextTestSetup({
+    files: {
+      pages: new FileRef(join(__dirname, 'pages')),
+    },
+    nextConfig: {
+      output: 'export',
+    },
+    skipStart: true,
   })
-  afterAll(() => next.destroy())
 
   it('should have built', async () => {
-    const html = await renderViaHTTP(next.url, '/')
-    expect(html).toContain('index page')
+    const result = await next.build()
+    expect(result.exitCode).toBe(0)
   })
 
   it('should not error with default exportPathMap', async () => {
-    await next.stop()
-
-    const result = await next.export()
+    const result = await next.build()
     console.log(result.cliOutput)
 
     expect(result.exitCode).toBe(0)
@@ -33,11 +28,11 @@ describe('fallback export error', () => {
   })
 
   it('should not error with valid exportPathMap', async () => {
-    await next.stop()
     await next.patchFile(
       'next.config.js',
       `
       module.exports = {
+        output: 'export',
         exportPathMap() {
           return {
             '/': { page: '/' },
@@ -48,7 +43,7 @@ describe('fallback export error', () => {
     )
 
     try {
-      const result = await next.export()
+      const result = await next.build()
       console.log(result.cliOutput)
 
       expect(result.exitCode).toBe(0)
@@ -66,6 +61,7 @@ describe('fallback export error', () => {
       'next.config.js',
       `
       module.exports = {
+        output: 'export',
         exportPathMap() {
           return {
             '/': { page: '/' },
@@ -77,7 +73,7 @@ describe('fallback export error', () => {
     )
 
     try {
-      const result = await next.export()
+      const result = await next.build()
       console.log(result.cliOutput)
 
       expect(result.exitCode).toBe(1)

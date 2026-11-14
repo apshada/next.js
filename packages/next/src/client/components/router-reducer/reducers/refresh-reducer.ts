@@ -1,118 +1,121 @@
-import { fetchServerResponse } from '../fetch-server-response'
-import { createRecordFromThenable } from '../create-record-from-thenable'
-import { readRecordValue } from '../read-record-value'
-import { createHrefFromUrl } from '../create-href-from-url'
-import { applyRouterStatePatchToTree } from '../apply-router-state-patch-to-tree'
-import { isNavigatingToNewRootLayout } from '../is-navigating-to-new-root-layout'
-import {
+import type {
   ReadonlyReducerState,
   ReducerState,
   RefreshAction,
 } from '../router-reducer-types'
-import { handleExternalUrl } from './navigate-reducer'
-import { handleMutable } from '../handle-mutable'
-import { CacheStates } from '../../../../shared/lib/app-router-context'
-import { fillLazyItemsTillLeafWithHead } from '../fill-lazy-items-till-leaf-with-head'
+import { ScrollBehavior } from '../router-reducer-types'
+import { navigateToKnownRoute } from '../../app-router-state'
+import { createNavigationSeed } from '../../segment-cache/decode-server-response'
+import {
+  invalidateSegmentCacheEntries,
+  segmentCacheMap,
+} from '../../segment-cache/cache'
+import { hasInterceptionRouteInCurrentTree } from './has-interception-route-in-current-tree'
+import { FreshnessPolicy, getCurrentNavigationLock } from '../../render-tree'
+import {
+  invalidateBfCache,
+  UnknownDynamicStaleTime,
+} from '../../segment-cache/bfcache'
 
 export function refreshReducer(
   state: ReadonlyReducerState,
   action: RefreshAction
 ): ReducerState {
-  const { cache, mutable, origin } = action
-  const href = state.canonicalUrl
-
-  const isForCurrentTree =
-    JSON.stringify(mutable.previousTree) === JSON.stringify(state.tree)
-
-  if (isForCurrentTree) {
-    return handleMutable(state, mutable)
+  // During a refresh, we invalidate the segment cache but not the route cache.
+  // The route cache contains the tree structure (which segments exist at a
+  // given URL) which doesn't change during a refresh. The segment cache
+  // contains the actual RSC data which needs to be re-fetched.
+  //
+  // The Instant Navigation Testing API can bypass cache invalidation to
+  // preserve prefetched data when refreshing after an MPA navigation. This is
+  // only used for testing and is not exposed in production builds by default.
+  const bypassCacheInvalidation =
+    process.env.__NEXT_EXPOSE_TESTING_API && action.bypassCacheInvalidation
+  if (!bypassCacheInvalidation) {
+    const currentNextUrl = state.nextUrl
+    const currentRoot = state.root
+    invalidateSegmentCacheEntries(currentNextUrl, currentRoot)
   }
+  // A full refresh has no HMR generation to cancel.
+  return refreshDynamicData(state, FreshnessPolicy.RefreshAll, undefined)
+}
 
-  if (!cache.data) {
-    // TODO-APP: verify that `href` is not an external url.
-    // Fetch data from the root of the tree.
-    cache.data = createRecordFromThenable(
-      fetchServerResponse(
-        new URL(href, origin),
-        [state.tree[0], state.tree[1], state.tree[2], 'refetch'],
-        state.nextUrl
-      )
-    )
-  }
-  const [flightData, canonicalUrlOverride] = readRecordValue(cache.data!)
+export function refreshDynamicData(
+  state: ReadonlyReducerState,
+  freshnessPolicy: FreshnessPolicy.RefreshAll | FreshnessPolicy.HMRRefresh,
+  signal: AbortSignal | undefined
+): ReducerState {
+  // During a refresh, invalidate the BFCache, which may contain dynamic data.
+  invalidateBfCache()
 
-  // Handle case when navigating to page in `pages` from `app`
-  if (typeof flightData === 'string') {
-    return handleExternalUrl(
-      state,
-      mutable,
-      flightData,
-      state.pushRef.pendingPush
-    )
-  }
+  const currentNextUrl = state.nextUrl
 
-  // Remove cache.data as it has been resolved at this point.
-  cache.data = null
+  // We always send the last next-url, not the current when performing a dynamic
+  // request. This is because we update the next-url after a navigation, but we
+  // want the same interception route to be matched that used the last next-url.
+  const nextUrlForRefresh = hasInterceptionRouteInCurrentTree(state.tree)
+    ? state.previousNextUrl || currentNextUrl
+    : null
 
-  let currentTree = state.tree
+  // A refresh is modeled as a navigation to the current URL, but where any
+  // existing dynamic data (including in shared layouts) is re-fetched.
+  const currentCanonicalUrl = state.canonicalUrl
+  const currentUrl = new URL(currentCanonicalUrl, location.origin)
+  const currentRenderedSearch = state.renderedSearch
+  const currentFlightRouterState = state.tree
+  const scrollBehavior = ScrollBehavior.NoScroll
+  const navigationLock = getCurrentNavigationLock()
 
-  for (const flightDataPath of flightData) {
-    // FlightDataPath with more than two items means unexpected Flight data was returned
-    if (flightDataPath.length !== 3) {
-      // TODO-APP: handle this case better
-      console.log('REFRESH FAILED')
-      return state
-    }
+  // Create a NavigationSeed from the current FlightRouterState.
+  // TODO: Eventually we will store this type directly on the state object
+  // instead of reconstructing it on demand. Part of a larger series of
+  // refactors to unify the various tree types that the client deals with.
+  const now = Date.now()
+  // TODO: Store the dynamic stale time on the top-level state so it's known
+  // during restores and refreshes.
+  const refreshSeed = createNavigationSeed(
+    now,
+    currentFlightRouterState,
+    // No transport data (and so no vary params, no partiality, and no
+    // pathname to parse params from) — this converts the base tree alone.
+    null,
+    null,
+    true,
+    null,
+    currentRenderedSearch,
+    null,
+    UnknownDynamicStaleTime
+  )
 
-    // Given the path can only have two items the items are only the router state and subTreeData for the root.
-    const [treePatch] = flightDataPath
-    const newTree = applyRouterStatePatchToTree(
-      // TODO-APP: remove ''
-      [''],
-      currentTree,
-      treePatch
-    )
-
-    if (newTree === null) {
-      throw new Error('SEGMENT MISMATCH')
-    }
-
-    if (isNavigatingToNewRootLayout(currentTree, newTree)) {
-      return handleExternalUrl(state, mutable, href, state.pushRef.pendingPush)
-    }
-
-    const canonicalUrlOverrideHref = canonicalUrlOverride
-      ? createHrefFromUrl(canonicalUrlOverride)
-      : undefined
-
-    if (canonicalUrlOverride) {
-      mutable.canonicalUrl = canonicalUrlOverrideHref
-    }
-
-    // The one before last item is the router state tree patch
-    const [subTreeData, head] = flightDataPath.slice(-2)
-
-    // Handles case where prefetch only returns the router tree patch without rendered components.
-    if (subTreeData !== null) {
-      cache.status = CacheStates.READY
-      cache.subTreeData = subTreeData
-      fillLazyItemsTillLeafWithHead(
-        cache,
-        // Existing cache is not passed in as `router.refresh()` has to invalidate the entire cache.
-        undefined,
-        treePatch,
-        head
-      )
-      mutable.cache = cache
-      mutable.prefetchCache = new Map()
-    }
-
-    mutable.previousTree = currentTree
-    mutable.patchedTree = newTree
-    mutable.canonicalUrl = href
-
-    currentTree = newTree
-  }
-
-  return handleMutable(state, mutable)
+  // If the previous navigation hasn't pushed its history entry yet (React
+  // hasn't committed its state), this refresh may commit in its place, so it
+  // takes over the push. If the navigation does commit first, HistoryUpdater
+  // sees that the URL already matches and replaces instead.
+  const navigateType = state.pushRef.pendingPush ? 'push' : 'replace'
+  return navigateToKnownRoute(
+    now,
+    state,
+    currentUrl,
+    currentCanonicalUrl,
+    refreshSeed,
+    currentUrl,
+    currentRenderedSearch,
+    state.root,
+    freshnessPolicy,
+    nextUrlForRefresh,
+    scrollBehavior,
+    navigateType,
+    navigationLock,
+    // A refresh is bound to the shared map.
+    segmentCacheMap,
+    null,
+    // Refresh navigations don't use route prediction, so there's no route
+    // cache entry to mark as having a dynamic rewrite on mismatch. If a
+    // mismatch occurs, the retry handler will traverse the known route tree
+    // to find and mark the entry.
+    null,
+    signal,
+    // Not part of a prepared navigation.
+    null
+  )
 }

@@ -1,97 +1,90 @@
-// useLayoutSegments() // Only the segments for the current place. ['children', 'dashboard', 'children', 'integrations'] -> /dashboard/integrations (/dashboard/layout.js would get ['children', 'dashboard', 'children', 'integrations'])
+import type { Params } from '../../server/request/params'
 
-import { useContext, useMemo } from 'react'
-import type { FlightRouterState } from '../../server/app-render/types'
+import React, { useContext, useMemo, use } from 'react'
 import {
   AppRouterContext,
-  GlobalLayoutRouterContext,
   LayoutRouterContext,
-} from '../../shared/lib/app-router-context'
+  type AppRouterInstance,
+} from '../../shared/lib/app-router-context.shared-runtime'
 import {
   SearchParamsContext,
   PathnameContext,
-} from '../../shared/lib/hooks-client-context'
-import { clientHookInServerComponentError } from './client-hook-in-server-component-error'
-import { getSegmentValue } from './router-reducer/reducers/get-segment-value'
+  PathParamsContext,
+  NavigationPromisesContext,
+  ReadonlyURLSearchParams,
+} from '../../shared/lib/hooks-client-context.shared-runtime'
+import {
+  computeSelectedLayoutSegment,
+  getSelectedLayoutSegmentPath,
+} from '../../shared/lib/segment'
 
-const INTERNAL_URLSEARCHPARAMS_INSTANCE = Symbol(
-  'internal for urlsearchparams readonly'
-)
+import {
+  useDynamicRouteParams,
+  useDynamicSearchParams,
+} from './navigation-dynamic-rendering'
 
-function readonlyURLSearchParamsError() {
-  return new Error('ReadonlyURLSearchParams cannot be modified')
-}
-
-export class ReadonlyURLSearchParams {
-  [INTERNAL_URLSEARCHPARAMS_INSTANCE]: URLSearchParams
-
-  entries: URLSearchParams['entries']
-  forEach: URLSearchParams['forEach']
-  get: URLSearchParams['get']
-  getAll: URLSearchParams['getAll']
-  has: URLSearchParams['has']
-  keys: URLSearchParams['keys']
-  values: URLSearchParams['values']
-  toString: URLSearchParams['toString']
-
-  constructor(urlSearchParams: URLSearchParams) {
-    this[INTERNAL_URLSEARCHPARAMS_INSTANCE] = urlSearchParams
-
-    this.entries = urlSearchParams.entries.bind(urlSearchParams)
-    this.forEach = urlSearchParams.forEach.bind(urlSearchParams)
-    this.get = urlSearchParams.get.bind(urlSearchParams)
-    this.getAll = urlSearchParams.getAll.bind(urlSearchParams)
-    this.has = urlSearchParams.has.bind(urlSearchParams)
-    this.keys = urlSearchParams.keys.bind(urlSearchParams)
-    this.values = urlSearchParams.values.bind(urlSearchParams)
-    this.toString = urlSearchParams.toString.bind(urlSearchParams)
-  }
-  [Symbol.iterator]() {
-    return this[INTERNAL_URLSEARCHPARAMS_INSTANCE][Symbol.iterator]()
-  }
-
-  append() {
-    throw readonlyURLSearchParamsError()
-  }
-  delete() {
-    throw readonlyURLSearchParamsError()
-  }
-  set() {
-    throw readonlyURLSearchParamsError()
-  }
-  sort() {
-    throw readonlyURLSearchParamsError()
-  }
-}
+const {
+  instrumentParamsForClientValidation,
+  instrumentSearchParamsForClientValidation,
+  expectCompleteParamsInClientValidation,
+} = process.env.__NEXT_CACHE_COMPONENTS
+  ? (require('./instant-samples') as typeof import('./instant-samples'))
+  : {}
 
 /**
- * Get a read-only URLSearchParams object. For example searchParams.get('foo') would return 'bar' when ?foo=bar
- * Learn more about URLSearchParams here: https://developer.mozilla.org/en-US/docs/Web/API/URLSearchParams
+ * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
+ * that lets you *read* the current URL's search parameters.
+ *
+ * Learn more about [`URLSearchParams` on MDN](https://developer.mozilla.org/docs/Web/API/URLSearchParams)
+ *
+ * @example
+ * ```ts
+ * "use client"
+ * import { useSearchParams } from 'next/navigation'
+ *
+ * export default function Page() {
+ *   const searchParams = useSearchParams()
+ *   searchParams.get('foo') // returns 'bar' when ?foo=bar
+ *   // ...
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `useSearchParams`](https://nextjs.org/docs/app/api-reference/functions/use-search-params)
  */
+// Client components API
 export function useSearchParams(): ReadonlyURLSearchParams {
-  clientHookInServerComponentError('useSearchParams')
+  useDynamicSearchParams?.('useSearchParams()')
+
   const searchParams = useContext(SearchParamsContext)
 
   // In the case where this is `null`, the compat types added in
   // `next-env.d.ts` will add a new overload that changes the return type to
   // include `null`.
-  const readonlySearchParams = useMemo(() => {
+  const readonlySearchParams = useMemo((): ReadonlyURLSearchParams => {
     if (!searchParams) {
       // When the router is not ready in pages, we won't have the search params
       // available.
-      return null
+      return null!
     }
 
     return new ReadonlyURLSearchParams(searchParams)
-  }, [searchParams]) as ReadonlyURLSearchParams
+  }, [searchParams])
 
-  if (typeof window === 'undefined') {
-    // AsyncLocalStorage should not be included in the client bundle.
-    const { bailoutToClientRendering } =
-      require('./bailout-to-client-rendering') as typeof import('./bailout-to-client-rendering')
-    if (bailoutToClientRendering()) {
-      // TODO-APP: handle dynamic = 'force-static' here and on the client
-      return readonlySearchParams
+  // During build-time instant validation, wrap with an proxy
+  // so that accessing undeclared search params throws an error.
+  if (
+    typeof window === 'undefined' &&
+    process.env.__NEXT_CACHE_COMPONENTS &&
+    readonlySearchParams
+  ) {
+    return instrumentSearchParamsForClientValidation!(readonlySearchParams)
+  }
+
+  // Instrument with Suspense DevTools (dev-only)
+  if (process.env.NODE_ENV !== 'production' && 'use' in React) {
+    const navigationPromises = use(NavigationPromisesContext)
+    if (navigationPromises) {
+      return use(navigationPromises.searchParams)
     }
   }
 
@@ -99,135 +92,279 @@ export function useSearchParams(): ReadonlyURLSearchParams {
 }
 
 /**
- * Get the current pathname. For example usePathname() on /dashboard?foo=bar would return "/dashboard"
+ * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
+ * that lets you read the current URL's pathname.
+ *
+ * @example
+ * ```ts
+ * "use client"
+ * import { usePathname } from 'next/navigation'
+ *
+ * export default function Page() {
+ *  const pathname = usePathname() // returns "/dashboard" on /dashboard?foo=bar
+ *  // ...
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `usePathname`](https://nextjs.org/docs/app/api-reference/functions/use-pathname)
  */
+// Client components API
 export function usePathname(): string {
-  clientHookInServerComponentError('usePathname')
+  useDynamicRouteParams?.('usePathname()')
+
   // In the case where this is `null`, the compat types added in `next-env.d.ts`
   // will add a new overload that changes the return type to include `null`.
-  return useContext(PathnameContext) as string
+  const pathname = useContext(PathnameContext) as string
+
+  // During build-time instant validation, error if fallback params exist
+  // because usePathname() can't return a sensible value without all params.
+  if (
+    typeof window === 'undefined' &&
+    process.env.__NEXT_CACHE_COMPONENTS &&
+    pathname
+  ) {
+    expectCompleteParamsInClientValidation!('usePathname()')
+    return pathname
+  }
+
+  // Instrument with Suspense DevTools (dev-only)
+  if (process.env.NODE_ENV !== 'production' && 'use' in React) {
+    const navigationPromises = use(NavigationPromisesContext)
+    if (navigationPromises) {
+      return use(navigationPromises.pathname)
+    }
+  }
+
+  return pathname
 }
 
+// Client components API
 export {
   ServerInsertedHTMLContext,
   useServerInsertedHTML,
-} from '../../shared/lib/server-inserted-html'
+} from '../../shared/lib/server-inserted-html.shared-runtime'
 
 /**
- * Get the router methods. For example router.push('/dashboard')
+ *
+ * This hook allows you to programmatically change routes inside [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components).
+ *
+ * @example
+ * ```ts
+ * "use client"
+ * import { useRouter } from 'next/navigation'
+ *
+ * export default function Page() {
+ *  const router = useRouter()
+ *  // ...
+ *  router.push('/dashboard') // Navigate to /dashboard
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `useRouter`](https://nextjs.org/docs/app/api-reference/functions/use-router)
  */
-export function useRouter(): import('../../shared/lib/app-router-context').AppRouterInstance {
-  clientHookInServerComponentError('useRouter')
+// Client components API
+export function useRouter(): AppRouterInstance {
   const router = useContext(AppRouterContext)
   if (router === null) {
     throw new Error('invariant expected app router to be mounted')
   }
 
-  return router
-}
-
-interface Params {
-  [key: string]: string
-}
-// TODO-APP: handle parallel routes
-function getSelectedParams(
-  tree: FlightRouterState,
-  params: Params = {}
-): Params {
-  // After first parallel route prefer children, if there's no children pick the first parallel route.
-  const parallelRoutes = tree[1]
-  const node = parallelRoutes.children ?? Object.values(parallelRoutes)[0]
-
-  if (!node) return params
-  const segment = node[0]
-  const isDynamicParameter = Array.isArray(segment)
-  const segmentValue = isDynamicParameter ? segment[1] : segment
-  if (!segmentValue || segmentValue.startsWith('__PAGE__')) return params
-
-  if (isDynamicParameter) {
-    params[segment[0]] = segment[1]
-  }
-
-  return getSelectedParams(node, params)
-}
-
-/**
- * Get the current parameters. For example useParams() on /dashboard/[team]
- * where pathname is /dashboard/nextjs would return { team: 'nextjs' }
- */
-export function useParams(): Params {
-  clientHookInServerComponentError('useParams')
-  const globalLayoutRouterContext = useContext(GlobalLayoutRouterContext)
-  if (!globalLayoutRouterContext) {
-    // This only happens in `pages`. Type is overwritten in navigation.d.ts
-    return null!
-  }
-  return getSelectedParams(globalLayoutRouterContext.tree)
-}
-
-// TODO-APP: handle parallel routes
-/**
- * Get the canonical parameters from the current level to the leaf node.
- */
-function getSelectedLayoutSegmentPath(
-  tree: FlightRouterState,
-  parallelRouteKey: string,
-  first = true,
-  segmentPath: string[] = []
-): string[] {
-  let node: FlightRouterState
-  if (first) {
-    // Use the provided parallel route key on the first parallel route
-    node = tree[1][parallelRouteKey]
-  } else {
-    // After first parallel route prefer children, if there's no children pick the first parallel route.
-    const parallelRoutes = tree[1]
-    node = parallelRoutes.children ?? Object.values(parallelRoutes)[0]
-  }
-
-  if (!node) return segmentPath
-  const segment = node[0]
-
-  const segmentValue = getSegmentValue(segment)
-  if (!segmentValue || segmentValue.startsWith('__PAGE__')) return segmentPath
-
-  segmentPath.push(segmentValue)
-
-  return getSelectedLayoutSegmentPath(
-    node,
-    parallelRouteKey,
-    false,
-    segmentPath
+  // Read the bfcacheId of the closest CacheNode and merge it into the
+  // returned router instance. This is contextual: callers in a shared
+  // layout get the layout's id; callers in a leaf segment get the leaf's.
+  // The id is stored on the CacheNode as a number and materialized as a
+  // string here. The format mirrors React's `useId()` (e.g. `_r_0_`) with
+  // a `b` prefix, so the id can be safely concatenated with other keys
+  // without collision.
+  const layout = useContext(LayoutRouterContext)
+  const bfcacheIdNumber = layout?.parentRenderTree.data.bfcacheId ?? 0
+  return useMemo<AppRouterInstance>(
+    () => ({
+      back: router.back,
+      forward: router.forward,
+      refresh: router.refresh,
+      hmrRefresh: router.hmrRefresh,
+      push: router.push,
+      replace: router.replace,
+      prefetch: router.prefetch,
+      experimental_gesturePush: router.experimental_gesturePush,
+      experimental_prepare: router.experimental_prepare,
+      bfcacheId: '_b_' + bfcacheIdNumber + '_',
+    }),
+    [router, bfcacheIdNumber]
   )
 }
 
-// TODO-APP: Expand description when the docs are written for it.
 /**
- * Get the canonical segment path from the current level to the leaf node.
+ * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
+ * that lets you read a route's dynamic params filled in by the current URL.
+ *
+ * @example
+ * ```ts
+ * "use client"
+ * import { useParams } from 'next/navigation'
+ *
+ * export default function Page() {
+ *   // on /dashboard/[team] where pathname is /dashboard/nextjs
+ *   const { team } = useParams() // team === "nextjs"
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `useParams`](https://nextjs.org/docs/app/api-reference/functions/use-params)
  */
+// Client components API
+export function useParams<T extends Params = Params>(): T {
+  useDynamicRouteParams?.('useParams()')
+
+  const params = useContext(PathParamsContext) as T
+
+  // During build-time instant validation, wrap with a proxy
+  // so that accessing undeclared params throws an error.
+  if (
+    typeof window === 'undefined' &&
+    process.env.__NEXT_CACHE_COMPONENTS &&
+    params
+  ) {
+    return instrumentParamsForClientValidation!(params)
+  }
+
+  // Instrument with Suspense DevTools (dev-only)
+  if (process.env.NODE_ENV !== 'production' && 'use' in React) {
+    const navigationPromises = use(NavigationPromisesContext)
+    if (navigationPromises) {
+      return use(navigationPromises.params) as T
+    }
+  }
+
+  return params
+}
+
+/**
+ * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
+ * that lets you read the active route segments **below** the Layout it is called from.
+ *
+ * @example
+ * ```ts
+ * 'use client'
+ *
+ * import { useSelectedLayoutSegments } from 'next/navigation'
+ *
+ * export default function ExampleClientComponent() {
+ *   const segments = useSelectedLayoutSegments()
+ *
+ *   return (
+ *     <ul>
+ *       {segments.map((segment, index) => (
+ *         <li key={index}>{segment}</li>
+ *       ))}
+ *     </ul>
+ *   )
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `useSelectedLayoutSegments`](https://nextjs.org/docs/app/api-reference/functions/use-selected-layout-segments)
+ */
+// Client components API
 export function useSelectedLayoutSegments(
   parallelRouteKey: string = 'children'
 ): string[] {
-  clientHookInServerComponentError('useSelectedLayoutSegments')
-  const { tree } = useContext(LayoutRouterContext)
-  return getSelectedLayoutSegmentPath(tree, parallelRouteKey)
+  useDynamicRouteParams?.('useSelectedLayoutSegments()')
+
+  const context = useContext(LayoutRouterContext)
+  // @ts-expect-error This only happens in `pages`. Type is overwritten in navigation.d.ts
+  if (!context) return null
+
+  // During build-time instant validation, error if fallback params exist
+  // because useSelectedLayoutSegments() can't return a sensible value without all params.
+  if (
+    typeof window === 'undefined' &&
+    process.env.__NEXT_CACHE_COMPONENTS &&
+    context
+  ) {
+    expectCompleteParamsInClientValidation!('useSelectedLayoutSegments()')
+  }
+
+  // Instrument with Suspense DevTools (dev-only)
+  if (process.env.NODE_ENV !== 'production' && 'use' in React) {
+    const navigationPromises = use(NavigationPromisesContext)
+    if (navigationPromises) {
+      const promise =
+        navigationPromises.selectedLayoutSegmentsPromises?.get(parallelRouteKey)
+      if (promise) {
+        // We should always have a promise here, but if we don't, it's not worth erroring over.
+        // We just won't be able to instrument it, but can still provide the value.
+        return use(promise)
+      }
+    }
+  }
+
+  return getSelectedLayoutSegmentPath(context.parentTree, parallelRouteKey)
 }
 
-// TODO-APP: Expand description when the docs are written for it.
 /**
- * Get the segment below the current level
+ * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
+ * that lets you read the active route segment **one level below** the Layout it is called from.
+ *
+ * @example
+ * ```ts
+ * 'use client'
+ * import { useSelectedLayoutSegment } from 'next/navigation'
+ *
+ * export default function ExampleClientComponent() {
+ *   const segment = useSelectedLayoutSegment()
+ *
+ *   return <p>Active segment: {segment}</p>
+ * }
+ * ```
+ *
+ * Read more: [Next.js Docs: `useSelectedLayoutSegment`](https://nextjs.org/docs/app/api-reference/functions/use-selected-layout-segment)
  */
+// Client components API
 export function useSelectedLayoutSegment(
   parallelRouteKey: string = 'children'
 ): string | null {
-  clientHookInServerComponentError('useSelectedLayoutSegment')
+  useDynamicRouteParams?.('useSelectedLayoutSegment()')
+  const navigationPromises = useContext(NavigationPromisesContext)
   const selectedLayoutSegments = useSelectedLayoutSegments(parallelRouteKey)
-  if (selectedLayoutSegments.length === 0) {
-    return null
+
+  // During build-time instant validation, error if fallback params exist
+  // because useSelectedLayoutSegment() can't return a sensible value without all params.
+  if (typeof window === 'undefined' && process.env.__NEXT_CACHE_COMPONENTS) {
+    expectCompleteParamsInClientValidation!('useSelectedLayoutSegment()')
   }
 
-  return selectedLayoutSegments[0]
+  // Instrument with Suspense DevTools (dev-only)
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    navigationPromises &&
+    'use' in React
+  ) {
+    const promise =
+      navigationPromises.selectedLayoutSegmentPromises?.get(parallelRouteKey)
+    if (promise) {
+      // We should always have a promise here, but if we don't, it's not worth erroring over.
+      // We just won't be able to instrument it, but can still provide the value.
+      return use(promise)
+    }
+  }
+
+  return computeSelectedLayoutSegment(selectedLayoutSegments, parallelRouteKey)
 }
 
-export { redirect } from './redirect'
-export { notFound } from './not-found'
+export { unstable_isUnrecognizedActionError } from './unrecognized-action-error'
+
+// Shared components APIs
+export {
+  // We need the same class that was used to instantiate the context value
+  // Otherwise instanceof checks will fail in usercode
+  ReadonlyURLSearchParams,
+}
+export {
+  notFound,
+  forbidden,
+  unauthorized,
+  redirect,
+  permanentRedirect,
+  RedirectType,
+  unstable_rethrow,
+} from './navigation.react-server'

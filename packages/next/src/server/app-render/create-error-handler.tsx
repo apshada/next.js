@@ -1,80 +1,258 @@
-import { DYNAMIC_ERROR_CODE } from '../../client/components/hooks-server-context'
+import type { ErrorInfo } from 'react'
 import stringHash from 'next/dist/compiled/string-hash'
+
 import { formatServerError } from '../../lib/format-server-error'
-import { isNotFoundError } from '../../client/components/not-found'
-import { isRedirectError } from '../../client/components/redirect'
-import { NEXT_DYNAMIC_NO_SSR_CODE } from '../../shared/lib/lazy-dynamic/no-ssr-error'
+import { SpanStatusCode, getTracer } from '../lib/trace/tracer'
+
+import { isAbortError } from '../pipe-readable'
+import { isBailoutToCSRError } from '../../shared/lib/lazy-dynamic/bailout-to-csr'
+import { isDynamicServerError } from '../../client/components/hooks-server-context'
+import { isNextRouterError } from '../../client/components/is-next-router-error'
+import { isPrerenderInterruptedError } from './dynamic-rendering'
+import { getProperError } from '../../lib/is-error'
+import { isReactLargeShellError } from './react-large-shell-error'
+import { isInstantValidationError } from './instant-validation/instant-validation-error'
+import { isNextBrowserBailoutError } from '../../shared/lib/lazy-dynamic/react-browser-bailout'
+import { workUnitAsyncStorage } from './work-unit-async-storage.external'
+
+declare global {
+  var __next_log_error__: undefined | ((err: unknown) => void)
+}
+
+type RSCErrorHandler = (err: unknown) => string | undefined
+type SSRErrorHandler = (
+  err: unknown,
+  errorInfo?: ErrorInfo
+) => string | undefined
+
+export type DigestedError = Error & { digest: string; environmentName?: string }
 
 /**
- * Create error handler for renderers.
- * Tolerate dynamic server errors during prerendering so console
- * isn't spammed with unactionable errors
+ * Returns a digest for well-known Next.js errors, otherwise `undefined`. If a
+ * digest is returned this also means that the error does not need to be
+ * reported.
  */
-export function createErrorHandler({
-  /**
-   * Used for debugging
-   */
-  _source,
-  dev,
-  isNextExport,
-  errorLogger,
-  capturedErrors,
-  allCapturedErrors,
-}: {
-  _source: string
-  dev?: boolean
-  isNextExport?: boolean
-  errorLogger?: (err: any) => Promise<void>
-  capturedErrors: Error[]
-  allCapturedErrors?: Error[]
-}) {
-  return (err: any): string => {
-    if (allCapturedErrors) allCapturedErrors.push(err)
+export function getDigestForWellKnownError(error: unknown): string | undefined {
+  // If we're bailing out to CSR, we don't need to log the error.
+  if (isBailoutToCSRError(error)) return error.digest
 
-    if (
-      err &&
-      (err.digest === DYNAMIC_ERROR_CODE ||
-        isNotFoundError(err) ||
-        err.digest === NEXT_DYNAMIC_NO_SSR_CODE ||
-        isRedirectError(err))
-    ) {
-      return err.digest
+  // If this is a navigation error, we don't need to log the error.
+  if (isNextRouterError(error)) return error.digest
+
+  // If this error occurs, we know that we should be stopping the static
+  // render. This is only thrown in static generation when PPR is not enabled,
+  // which causes the whole page to be marked as dynamic. We don't need to
+  // tell the user about this error, as it's not actionable.
+  if (isDynamicServerError(error)) return error.digest
+
+  // If this is a prerender interrupted error, we don't need to log the error.
+  if (isPrerenderInterruptedError(error)) return error.digest
+
+  if (isInstantValidationError(error)) return error.digest
+
+  return undefined
+}
+
+export function createReactServerErrorHandler(
+  shouldFormatError: boolean,
+  isBuildTimePrerendering: boolean,
+  reactServerErrors: Map<string, DigestedError>,
+  onReactServerRenderError: (err: DigestedError, silenceLog: boolean) => void,
+  spanToRecordOn?: any,
+  renderErrorsByDigest?: Map<string, DigestedError>
+): RSCErrorHandler {
+  return (thrownValue: unknown) => {
+    // If the response was closed, we don't need to log the error.
+    if (isAbortError(thrownValue)) return
+
+    const digest = getDigestForWellKnownError(thrownValue)
+
+    if (digest) {
+      return digest
     }
+
+    if (isReactLargeShellError(thrownValue)) {
+      // TODO: Aggregate
+      console.error(thrownValue)
+      return undefined
+    }
+
+    let err = getProperError(thrownValue) as DigestedError
+    let silenceLog = false
+
+    // If the error already has a digest, respect the original digest,
+    // so it won't get re-generated into another new error.
+    if (err.digest) {
+      const originalError = reactServerErrors.get(err.digest)
+
+      if (originalError) {
+        // This error crossed a react-server boundary (e.g. from a `'use cache'`
+        // render). Reaching the handler means it surfaced (it wasn't caught in
+        // userland), so stamp the digest onto the original to mark it surfaced.
+        // If the original was recorded as `invalidDynamicUsageError` without a
+        // digest (a cache that aborted across the boundary), this is what lets
+        // the dev overlay dedup: the separate forwarding checks for that digest
+        // and skips it.
+        originalError.digest ??= err.digest
+
+        if (process.env.NODE_ENV === 'production') {
+          // In production we use the recovered original (de-obfuscated!) error
+          // for reporting, and don't log it again as it was already logged in
+          // the original environment.
+          err = originalError
+          silenceLog = true
+        }
+      }
+    } else {
+      // TODO-APP: look at using webcrypto instead of string-hash. Requires a promise to be awaited.
+      err.digest =
+        typeof thrownValue === 'string'
+          ? stringHash(thrownValue).toString()
+          : stringHash(err.message + (err.stack || '')).toString()
+    }
+
+    // @TODO by putting this here and not at the top it is possible that
+    // we don't error the build in places we actually expect to
+    if (!reactServerErrors.has(err.digest)) {
+      reactServerErrors.set(err.digest, err)
+    }
+
+    renderErrorsByDigest?.set(err.digest, err)
 
     // Format server errors in development to add more helpful error messages
-    if (dev) {
+    if (shouldFormatError) {
       formatServerError(err)
     }
-    // Used for debugging error source
-    // console.error(_source, err)
+
     // Don't log the suppressed error during export
     if (
       !(
-        isNextExport &&
+        isBuildTimePrerendering &&
         err?.message?.includes(
           'The specific message is omitted in production builds to avoid leaking sensitive details.'
         )
       )
     ) {
-      if (errorLogger) {
-        errorLogger(err).catch(() => {})
+      // Record exception on the provided span if available, otherwise try active span.
+      const span = spanToRecordOn ?? getTracer().getActiveScopeSpan()
+      if (span) {
+        span.recordException(err)
+        span.setAttribute('error.type', err.name)
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err.message,
+        })
+      }
+
+      // Error reporting is not rendering. Telemetry reads must not interrupt
+      // the render or opt it into dynamic rendering.
+      workUnitAsyncStorage.exit(onReactServerRenderError, err, silenceLog)
+    }
+
+    return err.digest
+  }
+}
+
+export function createHTMLErrorHandler(
+  shouldFormatError: boolean,
+  isBuildTimePrerendering: boolean,
+  reactBrowserBailout: boolean,
+  reactServerErrors: Map<string, DigestedError>,
+  allCapturedErrors: Array<unknown>,
+  onHTMLRenderSSRError: (err: DigestedError, errorInfo?: ErrorInfo) => void,
+  spanToRecordOn?: any
+): SSRErrorHandler {
+  return (thrownValue: unknown, errorInfo?: ErrorInfo) => {
+    if (isReactLargeShellError(thrownValue)) {
+      // TODO: Aggregate
+      console.error(thrownValue)
+      return undefined
+    }
+
+    let isSSRError = true
+
+    allCapturedErrors.push(thrownValue)
+
+    // If the response was closed, we don't need to log the error.
+    if (isAbortError(thrownValue)) return
+
+    // React turns a browser bailout outside Suspense into a fatal error. This
+    // is a framework signal handled by the prerender caller, so don't report it
+    // as a userland render error here.
+    if (reactBrowserBailout && isNextBrowserBailoutError(thrownValue)) {
+      return
+    }
+
+    const digest = getDigestForWellKnownError(thrownValue)
+
+    if (digest) {
+      return digest
+    }
+
+    const err = getProperError(thrownValue) as DigestedError
+
+    // If the error already has a digest, respect the original digest,
+    // so it won't get re-generated into another new error.
+    if (err.digest) {
+      if (reactServerErrors.has(err.digest)) {
+        // This error is likely an obfuscated error from react-server.
+        // We recover the original error here.
+        thrownValue = reactServerErrors.get(err.digest)
+        isSSRError = false
       } else {
-        // The error logger is currently not provided in the edge runtime.
-        // Use `log-app-dir-error` instead.
-        // It won't log the source code, but the error will be more useful.
-        if (process.env.NODE_ENV !== 'production') {
-          const { logAppDirError } =
-            require('../dev/log-app-dir-error') as typeof import('../dev/log-app-dir-error')
-          logAppDirError(err)
+        // The error is not from react-server but has a digest
+        // from other means so we don't need to produce a new one
+      }
+    } else {
+      err.digest = stringHash(
+        err.message + (errorInfo?.componentStack || err.stack || '')
+      ).toString()
+    }
+
+    // Format server errors in development to add more helpful error messages
+    if (shouldFormatError) {
+      formatServerError(err)
+    }
+
+    // Don't log the suppressed error during export
+    if (
+      !(
+        isBuildTimePrerendering &&
+        err?.message?.includes(
+          'The specific message is omitted in production builds to avoid leaking sensitive details.'
+        )
+      )
+    ) {
+      // HTML errors contain RSC errors as well, filter them out before reporting
+      if (isSSRError) {
+        // Record exception on the provided span if available, otherwise try active span.
+        const span = spanToRecordOn ?? getTracer().getActiveScopeSpan()
+        if (span) {
+          span.recordException(err)
+          span.setAttribute('error.type', err.name)
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: err.message,
+          })
         }
-        if (process.env.NODE_ENV === 'production') {
-          console.error(err)
-        }
+
+        // Keep SSR error reporting outside the render scope as well.
+        workUnitAsyncStorage.exit(onHTMLRenderSSRError, err, errorInfo)
       }
     }
 
-    capturedErrors.push(err)
-    // TODO-APP: look at using webcrypto instead. Requires a promise to be awaited.
-    return stringHash(err.message + err.stack + (err.digest || '')).toString()
+    return err.digest
   }
+}
+
+export function isUserLandError(
+  err: any,
+  reactBrowserBailout: boolean
+): boolean {
+  return (
+    !isAbortError(err) &&
+    !isBailoutToCSRError(err) &&
+    !(reactBrowserBailout && isNextBrowserBailoutError(err)) &&
+    !isNextRouterError(err)
+  )
 }

@@ -6,6 +6,7 @@ export default function UI({
   getCookie,
   getHeader,
   setCookie,
+  setCookieAndRedirect,
   getAuthedUppercase,
 }) {
   const [result, setResult] = useState('')
@@ -64,6 +65,35 @@ export default function UI({
       >
         getAuthedUppercase
       </button>
+      <form>
+        <button
+          id="setCookieAndRedirect"
+          formAction={async () => {
+            await setCookieAndRedirect(
+              'redirect',
+              Math.random().toString(36).substring(7),
+              '/redirect-target'
+            )
+          }}
+        >
+          setCookieAndRedirect
+        </button>
+      </form>
+      <form>
+        <button
+          id="setCookieAndRedirectReplace"
+          formAction={async () => {
+            await setCookieAndRedirect(
+              'redirect',
+              Math.random().toString(36).substring(7),
+              '/redirect-target',
+              'replace'
+            )
+          }}
+        >
+          setCookieAndRedirectReplace
+        </button>
+      </form>
     </div>
   )
 }

@@ -1,8 +1,17 @@
-/// <reference types="node" />
-import type { SatoriOptions } from "next/dist/compiled/@vercel/og/satori";
-import type { EmojiType } from './emoji';
-import type { OutgoingHttpHeader } from 'http';
-declare type ImageOptions = {
+import { SatoriOptions } from "next/dist/compiled/@vercel/og/satori";
+import { OutgoingHttpHeader } from 'http';
+
+declare const apis: {
+    twemoji: (code: any) => string;
+    openmoji: string;
+    blobmoji: string;
+    noto: string;
+    fluent: (code: any) => string;
+    fluentFlat: (code: any) => string;
+};
+type EmojiType = keyof typeof apis;
+
+type ImageOptions = {
     /**
      * The width of the image.
      *
@@ -34,18 +43,17 @@ declare type ImageOptions = {
     /**
      * Using a specific Emoji style. Defaults to `twemoji`.
      *
-     * @link https://github.com/vercel/og#emoji
      * @type {EmojiType}
      * @default 'twemoji'
      */
     emoji?: EmojiType;
 };
-export declare type ImageResponseNodeOptions = ImageOptions & {
+type ImageResponseNodeOptions = ImageOptions & {
     status?: number;
     statusText?: string;
     headers?: OutgoingHttpHeader[];
 };
-export declare type ImageResponseOptions = ImageOptions & ConstructorParameters<typeof Response>[1];
+type ImageResponseOptions = ImageOptions & ConstructorParameters<typeof Response>[1];
 declare module 'react' {
     interface HTMLAttributes<T> {
         /**
@@ -62,4 +70,5 @@ declare module 'react' {
         tw?: string;
     }
 }
-export {};
+
+export { ImageResponseNodeOptions, ImageResponseOptions };

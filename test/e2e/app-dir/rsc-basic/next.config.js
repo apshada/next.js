@@ -3,10 +3,7 @@ module.exports = {
   onDemandEntries: {
     maxInactiveAge: 1000 * 60 * 60,
   },
-  experimental: {
-    appDir: true,
-    serverComponentsExternalPackages: ['conditional-exports-optout'],
-  },
+  serverExternalPackages: ['conditional-exports-optout'],
   rewrites: async () => {
     return {
       afterFiles: [

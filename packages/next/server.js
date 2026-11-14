@@ -5,23 +5,14 @@ const serverExports = {
     .NextResponse,
   ImageResponse: require('next/dist/server/web/spec-extension/image-response')
     .ImageResponse,
-  unstable_cache: require('next/dist/server/web/spec-extension/unstable-cache')
-    .unstable_cache,
-  unstable_revalidateTag:
-    require('next/dist/server/web/spec-extension/unstable-revalidate-tag')
-      .unstable_revalidateTag,
-  unstable_revalidatePath:
-    require('next/dist/server/web/spec-extension/unstable-revalidate-path')
-      .unstable_revalidatePath,
   userAgentFromString: require('next/dist/server/web/spec-extension/user-agent')
     .userAgentFromString,
   userAgent: require('next/dist/server/web/spec-extension/user-agent')
     .userAgent,
-}
-
-if (typeof URLPattern !== 'undefined') {
-  // eslint-disable-next-line no-undef
-  serverExports.URLPattern = URLPattern
+  URLPattern: require('next/dist/server/web/spec-extension/url-pattern')
+    .URLPattern,
+  after: require('next/dist/server/after').after,
+  connection: require('next/dist/server/request/connection').connection,
 }
 
 // https://nodejs.org/api/esm.html#commonjs-namespaces
@@ -32,9 +23,8 @@ module.exports = serverExports
 exports.NextRequest = serverExports.NextRequest
 exports.NextResponse = serverExports.NextResponse
 exports.ImageResponse = serverExports.ImageResponse
-exports.unstable_cache = serverExports.unstable_cache
-exports.unstable_revalidatePath = serverExports.unstable_revalidatePath
-exports.unstable_revalidateTag = serverExports.unstable_revalidateTag
 exports.userAgentFromString = serverExports.userAgentFromString
 exports.userAgent = serverExports.userAgent
 exports.URLPattern = serverExports.URLPattern
+exports.after = serverExports.after
+exports.connection = serverExports.connection

@@ -1,7 +1,5 @@
-import { createNext } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { nextTestSetup } from 'e2e-utils'
 import { fetchViaHTTP } from 'next-test-utils'
-import fs from 'fs-extra'
 import path from 'path'
 
 const files = {
@@ -35,15 +33,10 @@ const files = {
 }
 
 describe('Edge Runtime is addressable', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files,
-      dependencies: {},
-    })
+  const { next } = nextTestSetup({
+    files,
+    dependencies: {},
   })
-  afterAll(() => next.destroy())
 
   test('EdgeRuntime evaluates to a string', async () => {
     const resp = await fetchViaHTTP(next.url, '/')
@@ -55,29 +48,31 @@ describe('Edge Runtime is addressable', () => {
   })
 
   test('removes the undefined branch with dead code elimination', async () => {
-    const compiledMiddlewareFile = await fs.readFile(
-      path.join(next.testDir, '.next/server/middleware.js'),
-      'utf8'
+    const middlewareManifest = await next.readJSON(
+      '.next/server/middleware-manifest.json'
     )
 
-    expect(compiledMiddlewareFile).toContain('EdgeRuntime is defined')
-    expect(compiledMiddlewareFile).not.toContain('EdgeRuntime is undefined')
+    const files = middlewareManifest.middleware['/'].files
+
+    let allContentCombined = ''
+    for (const file of files) {
+      const content = await next.readFile(path.join('.next', file))
+      allContentCombined += content
+    }
+
+    expect(allContentCombined).toContain('EdgeRuntime is defined')
+    expect(allContentCombined).not.toContain('EdgeRuntime is undefined')
   })
 })
 
 describe('Edge Runtime can be set to the production provider', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files,
-      dependencies: {},
-      env: {
-        NEXT_EDGE_RUNTIME_PROVIDER: 'vercel',
-      },
-    })
+  const { next } = nextTestSetup({
+    files,
+    dependencies: {},
+    env: {
+      NEXT_EDGE_RUNTIME_PROVIDER: 'vercel',
+    },
   })
-  afterAll(() => next.destroy())
 
   test('EdgeRuntime evaluates to a string', async () => {
     const resp = await fetchViaHTTP(next.url, '/')

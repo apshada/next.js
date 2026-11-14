@@ -1,26 +1,8 @@
 {
   "$schema": "https://turborepo.org/schema.json",
-  "pipeline": {
-    "build-native": {
-      "dependsOn": ["^build-native"],
-      "outputs": ["native/*.node"]
-    },
-    "build-native-no-plugin": {
-      "dependsOn": ["^build-native-no-plugin"],
-      "outputs": ["native/*.node"]
-    },
-    "build-native-no-plugin-woa": {
-      "dependsOn": ["^build-native-no-plugin-woa"],
-      "outputs": ["native/*.node"]
-    },
-    "build-wasm": {
-      "dependsOn": ["^build-wasm"],
-      "outputs": ["crates/wasm/pkg/*"]
-    },
-    "cache-build-native": {
-      "dependsOn": ["^cache-build-native"],
-      "outputs": ["native/*.node"]
-    },
+  "globalEnv": ["CI", "NEXT_CI_RUNNER", "CARGO_BUILD_WARNINGS"],
+  "globalPassThroughEnv": ["RUSTC_WRAPPER", "SCCACHE_*"],
+  "tasks": {
     "build": {
       "dependsOn": ["^build"],
       "outputs": ["dist/**"]
@@ -29,6 +11,25 @@
       "dependsOn": ["^dev"],
       "outputs": ["dist/**"]
     },
-    "typescript": {}
-  }
+    "storybook": {},
+    "build-storybook": {
+      "dependsOn": ["^build-storybook"],
+      "outputs": ["storybook-static/**"]
+    },
+    "test-storybook": {
+      "dependsOn": ["^test-storybook"]
+    },
+    "pack-for-isolated-tests": {
+      "inputs": ["$TURBO_DEFAULT$", "dist/**"],
+      "outputs": ["packed.tgz"]
+    },
+    "typescript": {},
+    "//#typescript": {},
+    "//#get-test-timings": {
+      "inputs": ["run-tests.js"],
+      "outputs": ["test-timings.json"],
+      "env": ["KV_REST_API_URL", "KV_REST_API_TOKEN"]
+    }
+  },
+  "ui": "tui"
 }

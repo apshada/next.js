@@ -1,52 +1,178 @@
 #!/usr/bin/env node
-import arg from 'next/dist/compiled/arg/index.js'
-import { startServer, StartServerOptions } from '../server/lib/start-server'
-import { getPort, printAndExit } from '../server/lib/utils'
+
+import '../server/lib/cpu-profile'
+import { saveCpuProfile } from '../server/lib/cpu-profile'
+import type { StartServerOptions } from '../server/lib/start-server'
+import {
+  RESTART_EXIT_CODE,
+  getNodeDebugType,
+  getParsedDebugAddress,
+  getMaxOldSpaceSize,
+  printAndExit,
+  formatNodeOptions,
+  formatDebugAddress,
+  getParsedNodeOptions,
+  type DebugAddress,
+} from '../server/lib/utils'
 import * as Log from '../build/output/log'
-import { CliCommand } from '../lib/commands'
-import isError from '../lib/is-error'
 import { getProjectDir } from '../lib/get-project-dir'
-import { CONFIG_FILES, PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
+import { warnMissingReactDependencies } from '../lib/warn-missing-react-dependencies'
+import { ensureProfilesDir } from '../lib/profiles-dir'
 import path from 'path'
-import type { NextConfig, NextConfigComplete } from '../server/config-shared'
 import { traceGlobals } from '../trace/shared'
 import { Telemetry } from '../telemetry/storage'
-import loadConfig from '../server/config'
 import { findPagesDir } from '../lib/find-pages-dir'
-import { fileExists } from '../lib/file-exists'
+import { fileExists, FileType } from '../lib/file-exists'
 import { getNpxCommand } from '../lib/helpers/get-npx-command'
-import Watchpack from 'next/dist/compiled/watchpack'
-import stripAnsi from 'next/dist/compiled/strip-ansi'
-import { getPossibleInstrumentationHookFilenames } from '../build/worker'
+import { createSelfSignedCertificate } from '../lib/mkcert'
+import type { SelfSignedCertificate } from '../lib/mkcert'
+import uploadTrace from '../trace/upload-trace'
+import { initialEnv, loadEnvConfig } from '@next/env'
+import { fork } from 'child_process'
+import type { ChildProcess } from 'child_process'
+import type { UpgradeContext, UpgradeReminder } from '../lib/upgrade/nudge'
+import {
+  closedUpgradeMenu,
+  createPromptOutput,
+  drainPromptOutput,
+  flushUpgradeTelemetry,
+  getPromptOutputEnv,
+  reassertRawMode,
+  showUpgradeMenu,
+  type UpgradeMenuResult,
+} from '../lib/upgrade/prompt-output'
+import {
+  getReservedPortExplanation,
+  isPortIsReserved,
+} from '../lib/helpers/get-reserved-port'
+import { getCacheDirectory } from '../lib/helpers/get-cache-directory'
+import { getGitBranch } from '../lib/helpers/git'
+import os from 'os'
+import fs from 'node:fs'
+import { once } from 'node:events'
+import { clearTimeout } from 'timers'
+import { trace, initializeTraceState, exportTraceState } from '../trace'
+import { traceId } from '../trace/shared'
+import { Bundler, parseBundlerArgs } from '../lib/bundler'
+
+export type NextDevOptions = {
+  disableSourceMaps: boolean
+  // Commander is not putting `--inspect` through the arg parser
+  inspect?: DebugAddress | true
+  turbo?: boolean
+  turbopack?: boolean
+  webpack?: boolean
+  customWebpack?: boolean
+  port: number
+  hostname?: string
+  experimentalHttps?: boolean
+  experimentalHttpsKey?: string
+  experimentalHttpsCert?: string
+  experimentalHttpsCa?: string
+  experimentalUploadTrace?: string
+  experimentalNextConfigStripTypes?: boolean
+  experimentalCpuProf?: boolean
+  serverFastRefresh?: boolean
+  internalTrace?: string | boolean
+}
+
+type PortSource = 'cli' | 'default' | 'env'
 
 let dir: string
-let isTurboSession = false
+let child: undefined | ChildProcess
+// distDir is received from the child process via IPC, used for telemetry and trace.
+let distDir: string | undefined
+let serverTelemetrySettings: { disabled: string | undefined } | undefined
+let isTurbopack: boolean
+let traceUploadUrl: string
 let sessionStopHandled = false
-let sessionStarted = Date.now()
+let upgradeController: AbortController | null = null
+let upgradeMenu: Promise<UpgradeMenuResult> | undefined
+// Holds the dev server's output while the upgrade menu is open.
+const promptOutput = createPromptOutput()
+let upgradeOffered = false
+let upgradeInProgress = false
+let interruption: NodeJS.Signals | null = null
+// Set when the server child was terminated by a signal that this process did
+// not send, so that `next dev` exits with the conventional 128 + signal code.
+let childExitSignal: NodeJS.Signals | null = null
+let devSpanAttrs: { 'rage-restart': boolean; 'missing-next-dir': boolean } = {
+  'rage-restart': false,
+  'missing-next-dir': false,
+}
+const sessionStarted = Date.now()
+const sessionSpan = trace('next-dev')
 
-const handleSessionStop = async () => {
-  if (sessionStopHandled) return
+// If the user restarts the dev server within this window we count it as a "rage restart".
+const RAGE_RESTART_THRESHOLD_MS = 90_000
+
+// Shape of a single project entry in the dev-state.json file.
+// All fields are optional so older entries without gitBranch are still valid.
+type DevStateEntry = {
+  stopTime?: number
+  distDirPath?: string
+  gitBranch?: string
+}
+
+// Single shared file for all projects — keyed by project directory path.
+const DEV_STATE_FILE = path.join(
+  getCacheDirectory('nextjs-nodejs'),
+  'dev-state.json'
+)
+
+// How long should we wait for the child to cleanly exit after sending
+// SIGINT/SIGTERM to the child process before sending SIGKILL?
+const CHILD_EXIT_TIMEOUT_MS = parseInt(
+  process.env.NEXT_EXIT_TIMEOUT_MS ?? '100',
+  10
+)
+const shouldWaitForChildExit =
+  process.env.__NEXT_DEV_WAIT_FOR_TURBOPACK_SHUTDOWN === '1'
+
+const handleSessionStop = async (
+  signal: NodeJS.Signals | number | null,
+  exit = true
+) => {
+  if (signal != null && child?.pid) {
+    child.kill(signal)
+  }
+  if (sessionStopHandled) {
+    return
+  }
   sessionStopHandled = true
+  const interruptedUpgrade = upgradeInProgress
+  // Close the menu and let it print what it held.
+  upgradeController?.abort()
+  await closedUpgradeMenu(upgradeMenu)
+
+  // Capture the child's exit code if it has already exited and caused the
+  // session stop (via the 'exit' event), otherwise assume success (0). A
+  // worker that exited to restart is not a failure.
+  const exitCode =
+    child?.exitCode === RESTART_EXIT_CODE ? 0 : child?.exitCode || 0
+
+  if (
+    signal != null &&
+    child?.pid &&
+    child.exitCode === null &&
+    child.signalCode === null
+  ) {
+    let exitTimeout: NodeJS.Timeout | undefined
+    if (!shouldWaitForChildExit) {
+      exitTimeout = setTimeout(() => {
+        child?.kill('SIGKILL')
+      }, CHILD_EXIT_TIMEOUT_MS)
+    }
+    await once(child, 'exit').catch(() => {})
+    if (exitTimeout) clearTimeout(exitTimeout)
+    await drainPromptOutput(child)
+  }
+
+  sessionSpan.stop()
 
   try {
-    const { eventCliSession } =
+    const { eventCliSessionStopped } =
       require('../telemetry/events/session-stopped') as typeof import('../telemetry/events/session-stopped')
-
-    const config = await loadConfig(
-      PHASE_DEVELOPMENT_SERVER,
-      dir,
-      undefined,
-      undefined,
-      true
-    )
-
-    let telemetry =
-      (traceGlobals.get('telemetry') as InstanceType<
-        typeof import('../telemetry/storage').Telemetry
-      >) ||
-      new Telemetry({
-        distDir: path.join(dir, config.distDir),
-      })
 
     let pagesDir: boolean = !!traceGlobals.get('pagesDir')
     let appDir: boolean = !!traceGlobals.get('appDir')
@@ -55,114 +181,188 @@ const handleSessionStop = async () => {
       typeof traceGlobals.get('pagesDir') === 'undefined' ||
       typeof traceGlobals.get('appDir') === 'undefined'
     ) {
-      const pagesResult = findPagesDir(dir, !!config.experimental.appDir)
+      const pagesResult = findPagesDir(dir)
       appDir = !!pagesResult.appDir
       pagesDir = !!pagesResult.pagesDir
     }
 
-    telemetry.record(
-      eventCliSession({
+    // The CLI parent does not load config; read .env opt-outs before creating telemetry.
+    loadEnvConfig(dir, true)
+    if (serverTelemetrySettings?.disabled) {
+      process.env.NEXT_TELEMETRY_DISABLED = serverTelemetrySettings.disabled
+    }
+    // Config may have opted out before startup failed. Do not assume telemetry
+    // is enabled until the current server child has reported its setting.
+    const telemetry = serverTelemetrySettings
+      ? (traceGlobals.get('telemetry') as InstanceType<
+          typeof import('../telemetry/storage').Telemetry
+        >) ||
+        new Telemetry({
+          distDir: path.join(dir, distDir || '.next'),
+        })
+      : undefined
+
+    telemetry?.record(
+      eventCliSessionStopped({
         cliCommand: 'dev',
-        turboFlag: isTurboSession,
+        turboFlag: isTurbopack,
         durationMilliseconds: Date.now() - sessionStarted,
         pagesDir,
         appDir,
       }),
       true
     )
-    telemetry.flushDetached('dev', dir)
+    telemetry?.flushDetached({ mode: 'dev', dir, events: null })
   } catch (_) {
     // errors here aren't actionable so don't add
     // noise to the output
   }
 
+  if (traceUploadUrl && distDir) {
+    uploadTrace({
+      traceUploadUrl,
+      mode: 'dev',
+      projectDir: dir,
+      distDir,
+      isTurboSession: isTurbopack,
+    })
+
+    writeDevState()
+  }
+
+  // Save CPU profile if it was enabled (before exiting)
+  saveCpuProfile()
+
   // ensure we re-enable the terminal cursor before exiting
   // the program, or the cursor could remain hidden
   process.stdout.write('\x1B[?25h')
   process.stdout.write('\n')
-  process.exit(0)
-}
-
-process.on('SIGINT', handleSessionStop)
-process.on('SIGTERM', handleSessionStop)
-
-let unwatchConfigFiles: () => void
-
-function watchConfigFiles(
-  dirToWatch: string,
-  onChange = (filename: string) =>
-    Log.warn(
-      `\n> Found a change in ${path.basename(
-        filename
-      )}. Restart the server to see the changes in effect.`
+  if (exit) {
+    await flushUpgradeTelemetry()
+    process.exit(
+      interruption && (interruption === 'SIGHUP' || interruptedUpgrade)
+        ? 128 + os.constants.signals[interruption]
+        : childExitSignal
+          ? 128 + os.constants.signals[childExitSignal]
+          : exitCode
     )
-) {
-  if (unwatchConfigFiles) {
-    unwatchConfigFiles()
   }
-
-  const wp = new Watchpack()
-  wp.watch({ files: CONFIG_FILES.map((file) => path.join(dirToWatch, file)) })
-  wp.on('change', onChange)
-  unwatchConfigFiles = () => wp.close()
 }
 
-const nextDev: CliCommand = async (argv) => {
-  const validArgs: arg.Spec = {
-    // Types
-    '--help': Boolean,
-    '--port': Number,
-    '--hostname': String,
-    '--turbo': Boolean,
+const onInterrupt = () => {
+  interruption = 'SIGINT'
+  void handleSessionStop('SIGINT')
+}
+const onTerminate = () => {
+  interruption = 'SIGTERM'
+  void handleSessionStop('SIGTERM')
+}
+const onHangup = () => {
+  interruption = 'SIGHUP'
+  void handleSessionStop('SIGTERM')
+}
+process.on('SIGINT', onInterrupt)
+process.on('SIGTERM', onTerminate)
 
-    // To align current messages with native binary.
-    // Will need to adjust subcommand later.
-    '--show-all': Boolean,
-    '--root': String,
-
-    // Aliases
-    '-h': '--help',
-    '-p': '--port',
-    '-H': '--hostname',
+// exit event must be synchronous
+process.on('exit', () => {
+  child?.kill('SIGKILL')
+  // Catch aggressive kills (e.g. OOM, unhandled exception) that bypass handleSessionStop.
+  // SIGKILL of the parent cannot be caught; for all other exits this ensures state is written.
+  if (!sessionStopHandled) {
+    writeDevState()
   }
-  let args: arg.Result<arg.Spec>
-  try {
-    args = arg(validArgs, { argv })
-  } catch (error) {
-    if (isError(error) && error.code === 'ARG_UNKNOWN_OPTION') {
-      return printAndExit(error.message, 1)
+})
+
+const nextDev = async (
+  options: NextDevOptions,
+  portSource: PortSource,
+  directory?: string
+) => {
+  // Note: parseBundlerArgs can only decide on Turbopack or webpack.
+  // Rspack can be configured via next.config.js but next.config.js is not loaded in the main process, only in the child process.
+  isTurbopack = parseBundlerArgs(options) === Bundler.Turbopack
+
+  dir = getProjectDir(process.env.NEXT_PRIVATE_DEV_DIR || directory)
+  warnMissingReactDependencies(dir)
+
+  const { shouldPromptForUpgrade, runUpgrade } = await import(
+    '../lib/upgrade/nudge.js'
+  )
+  const humanUpgrade = await shouldPromptForUpgrade()
+  if (humanUpgrade) {
+    // The server's output is piped, so it only knows the terminal width it
+    // started with. Pass on later resizes.
+    process.stdout.on('resize', () => {
+      if (child?.connected && process.stdout.columns) {
+        child.send({ nextTerminalColumns: process.stdout.columns })
+      }
+    })
+  }
+  const allowedUpgradeRetries = new Set<string>()
+  async function offerUpgrade(
+    context: UpgradeContext,
+    initialAssessment: Promise<UpgradeReminder | null> | null,
+    telemetryDisabled: string | undefined
+  ) {
+    process.on('SIGHUP', onHangup)
+    upgradeOffered = true
+    upgradeInProgress = true
+    const controller = new AbortController()
+    upgradeController = controller
+
+    upgradeMenu = showUpgradeMenu(promptOutput, {
+      dir,
+      context,
+      command: 'dev',
+      signal: controller.signal,
+      initialAssessment,
+      telemetryDisabled,
+    })
+    const result = await upgradeMenu
+    upgradeController = null
+
+    // Dev is already stopping (e.g. the server crashed).
+    if (sessionStopHandled) {
+      return
     }
-    throw error
+    if (result === 'interrupt') {
+      onInterrupt()
+      return
+    }
+    if (result) {
+      // The server is stopping, so its output doesn't matter.
+      promptOutput.discard()
+      await handleSessionStop('SIGTERM', false)
+      if (interruption) {
+        await flushUpgradeTelemetry()
+        process.exit(128 + os.constants.signals[interruption])
+      }
+      process.off('SIGINT', onInterrupt)
+      process.off('SIGTERM', onTerminate)
+      process.off('SIGHUP', onHangup)
+      const exitCode = await runUpgrade(dir, result.policy, result.nudgeId)
+      await flushUpgradeTelemetry()
+      process.exit(exitCode)
+    }
+    upgradeInProgress = false
+    process.off('SIGHUP', onHangup)
   }
-  if (args['--help']) {
-    console.log(`
-      Description
-        Starts the application in development mode (hot-code reloading, error
-        reporting, etc.)
-
-      Usage
-        $ next dev <dir> -p <port number>
-
-      <dir> represents the directory of the Next.js application.
-      If no directory is provided, the current directory will be used.
-
-      Options
-        --port, -p      A port number on which to start the application
-        --hostname, -H  Hostname on which to start the application (default: 0.0.0.0)
-        --help, -h      Displays this message
-    `)
-    process.exit(0)
-  }
-  dir = getProjectDir(process.env.NEXT_PRIVATE_DEV_DIR || args._[0])
 
   // Check if pages dir exists and warn if not
-  if (!(await fileExists(dir, 'directory'))) {
+  if (!(await fileExists(dir, FileType.Directory))) {
     printAndExit(`> No such directory exists as the project root: ${dir}`)
   }
 
-  async function preflight() {
+  if (options.experimentalCpuProf) {
+    Log.info(
+      `CPU profiling enabled. Profile will be saved to .next-profiles/ on exit (Ctrl+C).`
+    )
+  }
+
+  async function preflight(skipOnReboot: boolean) {
     const { getPackageVersion, getDependencies } = (await Promise.resolve(
-      require('../lib/get-package-version')
+      require('../lib/get-package-version') as typeof import('../lib/get-package-version')
     )) as typeof import('../lib/get-package-version')
 
     const [sassVersion, nodeSassVersion] = await Promise.all([
@@ -177,33 +377,99 @@ const nextDev: CliCommand = async (argv) => {
       )
     }
 
-    const { dependencies, devDependencies } = await getDependencies({
-      cwd: dir,
-    })
+    if (!skipOnReboot) {
+      const { dependencies, devDependencies } = await getDependencies({
+        cwd: dir,
+      })
 
-    // Warn if @next/font is installed as a dependency. Ignore `workspace:*` to not warn in the Next.js monorepo.
-    if (
-      dependencies['@next/font'] ||
-      (devDependencies['@next/font'] &&
-        devDependencies['@next/font'] !== 'workspace:*')
-    ) {
-      const command = getNpxCommand(dir)
-      Log.warn(
-        'Your project has `@next/font` installed as a dependency, please use the built-in `next/font` instead. ' +
-          'The `@next/font` package will be removed in Next.js 14. ' +
-          `You can migrate by running \`${command} @next/codemod@latest built-in-next-font .\`. Read more: https://nextjs.org/docs/messages/built-in-next-font`
-      )
+      // Warn if @next/font is installed as a dependency. Ignore `workspace:*` to not warn in the Next.js monorepo.
+      if (
+        dependencies['@next/font'] ||
+        (devDependencies['@next/font'] &&
+          devDependencies['@next/font'] !== 'workspace:*')
+      ) {
+        const command = getNpxCommand(dir)
+        Log.warn(
+          'Your project has `@next/font` installed as a dependency, please use the built-in `next/font` instead. ' +
+            'The `@next/font` package will be removed in Next.js 14. ' +
+            `You can migrate by running \`${command} @next/codemod@latest built-in-next-font .\`. Read more: https://nextjs.org/docs/messages/built-in-next-font`
+        )
+      }
     }
   }
 
-  const port = getPort(args)
+  let port = options.port
+
+  if (isPortIsReserved(port)) {
+    printAndExit(getReservedPortExplanation(port), 1)
+  }
+
   // If neither --port nor PORT were specified, it's okay to retry new ports.
-  const allowRetry =
-    args['--port'] === undefined && process.env.PORT === undefined
+  const allowRetry = portSource === 'default'
 
   // We do not set a default host value here to prevent breaking
   // some set-ups that rely on listening on other interfaces
-  const host = args['--hostname']
+  const host = options.hostname
+
+  if (
+    options.experimentalUploadTrace &&
+    !process.env.NEXT_TRACE_UPLOAD_DISABLED
+  ) {
+    traceUploadUrl = options.experimentalUploadTrace
+  }
+
+  if (traceUploadUrl) {
+    let isRageRestart = false
+    let distDirCleared = false
+    try {
+      if (fs.existsSync(DEV_STATE_FILE)) {
+        const allState = JSON.parse(
+          fs.readFileSync(DEV_STATE_FILE, 'utf8')
+        ) as Record<string, DevStateEntry>
+        const state = allState[dir]
+        if (
+          state?.stopTime &&
+          Date.now() - state.stopTime < RAGE_RESTART_THRESHOLD_MS
+        ) {
+          // Only flag as a rage restart if the git branch hasn't changed. If
+          // either the stored or current branch is unknown, skip the comparison
+          // and fall back to time-only detection.
+          const storedBranch = state.gitBranch
+          const currentBranch = getGitBranch(dir)
+          const branchChanged =
+            storedBranch && currentBranch && storedBranch !== currentBranch
+          if (!branchChanged) {
+            isRageRestart = true
+          }
+        }
+        if (state?.distDirPath && !fs.existsSync(state.distDirPath)) {
+          distDirCleared = true
+        }
+      }
+    } catch {
+      // Corrupt file — leave both flags false
+    }
+    devSpanAttrs = {
+      'rage-restart': isRageRestart,
+      'missing-next-dir': distDirCleared,
+    }
+  }
+
+  const enabledFeatures = Object.fromEntries(
+    Object.entries({
+      serverFastRefreshDisabled: options.serverFastRefresh === false,
+      experimentalCpuProf: options.experimentalCpuProf,
+    }).filter(([_, value]) => value)
+  )
+
+  for (const [key, value] of Object.entries(enabledFeatures)) {
+    sessionSpan.setAttribute(`feature.${key}`, value)
+  }
+
+  initializeTraceState({
+    ...exportTraceState(),
+    defaultParentSpanId: sessionSpan.getId(),
+  })
 
   const devServerOptions: StartServerOptions = {
     dir,
@@ -211,359 +477,293 @@ const nextDev: CliCommand = async (argv) => {
     allowRetry,
     isDev: true,
     hostname: host,
-    useWorkers: !process.env.__NEXT_DISABLE_MEMORY_WATCHER,
+    serverFastRefresh: options.serverFastRefresh,
   }
 
-  if (args['--turbo']) {
-    isTurboSession = true
+  const startServerPath = require.resolve('../server/lib/start-server')
 
-    const { validateTurboNextConfig } =
-      require('../lib/turbopack-warning') as typeof import('../lib/turbopack-warning')
-    const { loadBindings, __isCustomTurbopackBinary, teardownHeapProfiler } =
-      require('../build/swc') as typeof import('../build/swc')
-    const { eventCliSession } =
-      require('../telemetry/events/version') as typeof import('../telemetry/events/version')
-    const { setGlobal } = require('../trace') as typeof import('../trace')
-    require('../telemetry/storage') as typeof import('../telemetry/storage')
-    const findUp =
-      require('next/dist/compiled/find-up') as typeof import('next/dist/compiled/find-up')
+  async function startServer(startServerOptions: StartServerOptions) {
+    return new Promise<void>((resolve) => {
+      let resolved = false
+      const defaultEnv = (initialEnv || process.env) as typeof process.env
 
-    const isCustomTurbopack = await __isCustomTurbopackBinary()
-    const rawNextConfig = await validateTurboNextConfig({
-      isCustomTurbopack,
-      ...devServerOptions,
-      isDev: true,
-    })
+      const nodeOptions = getParsedNodeOptions()
 
-    const distDir = path.join(dir, rawNextConfig.distDir || '.next')
-    const { pagesDir, appDir } = findPagesDir(
-      dir,
-      !!rawNextConfig.experimental?.appDir
-    )
-    const telemetry = new Telemetry({
-      distDir,
-    })
-    setGlobal('appDir', appDir)
-    setGlobal('pagesDir', pagesDir)
-    setGlobal('telemetry', telemetry)
+      let maxOldSpaceSize: string | number | undefined = getMaxOldSpaceSize()
+      if (!maxOldSpaceSize && !process.env.NEXT_DISABLE_MEM_OVERRIDE) {
+        const totalMem = os.totalmem()
+        const totalMemInMB = Math.floor(totalMem / 1024 / 1024)
+        maxOldSpaceSize = Math.floor(totalMemInMB * 0.5).toString()
 
-    if (!isCustomTurbopack) {
-      telemetry.record(
-        eventCliSession(distDir, rawNextConfig as NextConfigComplete, {
-          webpackVersion: 5,
-          cliCommand: 'dev',
-          isSrcDir: path
-            .relative(dir, pagesDir || appDir || '')
-            .startsWith('src'),
-          hasNowJson: !!(await findUp('now.json', { cwd: dir })),
-          isCustomServer: false,
-          turboFlag: true,
-          pagesDir: !!pagesDir,
-          appDir: !!appDir,
-        })
-      )
-    }
+        nodeOptions['max-old-space-size'] = maxOldSpaceSize
 
-    const turboJson = findUp.sync('turbo.json', { cwd: dir })
-    // eslint-disable-next-line no-shadow
-    const packagePath = findUp.sync('package.json', { cwd: dir })
+        // Ensure the max_old_space_size is not also set.
+        delete nodeOptions['max_old_space_size']
+      }
 
-    let bindings: any = await loadBindings()
-    let server = bindings.turbo.startDev({
-      ...devServerOptions,
-      showAll: args['--show-all'] ?? false,
-      root:
-        args['--root'] ??
-        (turboJson
-          ? path.dirname(turboJson)
-          : packagePath
-          ? path.dirname(packagePath)
-          : undefined),
-    })
-    // Start preflight after server is listening and ignore errors:
-    preflight().catch(() => {})
+      if (options.disableSourceMaps) {
+        delete nodeOptions['enable-source-maps']
+      } else {
+        nodeOptions['enable-source-maps'] = true
+      }
 
-    if (!isCustomTurbopack) {
-      await telemetry.flush()
-    }
+      const nodeDebugType = getNodeDebugType(nodeOptions)
+      const originalAddress =
+        nodeDebugType === undefined ? undefined : nodeOptions[nodeDebugType]
+      delete nodeOptions.inspect
+      delete nodeOptions['inspect-brk']
+      delete nodeOptions['inspect_brk']
+      if (nodeDebugType !== undefined) {
+        const address = getParsedDebugAddress(originalAddress)
+        address.port = address.port === 0 ? 0 : address.port + 1
+        nodeOptions[nodeDebugType] = formatDebugAddress(address)
+      } else if (options.inspect) {
+        const address: DebugAddress =
+          options.inspect === true
+            ? getParsedDebugAddress(true)
+            : options.inspect
+        nodeOptions.inspect = formatDebugAddress(address)
+      }
 
-    // There are some cases like test fixtures teardown that normal flush won't hit.
-    // Force flush those on those case, but don't wait for it.
-    ;['SIGTERM', 'SIGINT', 'beforeExit', 'exit'].forEach((event) =>
-      process.on(event, () => teardownHeapProfiler())
-    )
+      const { nodeOptions: formattedNodeOptions, execArgv } =
+        formatNodeOptions(nodeOptions)
 
-    return server
-  } else {
-    let cleanupFns: (() => Promise<void> | void)[] = []
-    const runDevServer = async () => {
-      const oldCleanupFns = cleanupFns
-      cleanupFns = []
-      await Promise.allSettled(oldCleanupFns.map((fn) => fn()))
-
-      try {
-        let shouldFilter = false
-        let devServerTeardown: (() => Promise<void>) | undefined
-        let config: NextConfig | undefined
-
-        watchConfigFiles(devServerOptions.dir, (filename) => {
-          Log.warn(
-            `\n> Found a change in ${path.basename(
-              filename
-            )}. Restarting the server to apply the changes...`
-          )
-          runDevServer()
-        })
-        cleanupFns.push(unwatchConfigFiles)
-
-        const setupFork = async (newDir?: string) => {
-          // if we're using workers we can auto restart on config changes
-          if (!devServerOptions.useWorkers && devServerTeardown) {
-            Log.info(
-              `Detected change, manual restart required due to '__NEXT_DISABLE_MEMORY_WATCHER' usage`
-            )
-            return
-          }
-
-          if (devServerTeardown) {
-            await devServerTeardown()
-            devServerTeardown = undefined
-          }
-
-          const startDir = dir
-          if (newDir) {
-            dir = newDir
-            process.env = Object.keys(process.env).reduce((newEnv, key) => {
-              newEnv[key] = process.env[key]?.replace(startDir, newDir)
-              return newEnv
-            }, {} as typeof process.env)
-
-            process.chdir(newDir)
-
-            devServerOptions.dir = newDir
-            devServerOptions.prevDir = startDir
-          }
-
-          // since errors can start being logged from the fork
-          // before we detect the project directory rename
-          // attempt suppressing them long enough to check
-          const filterForkErrors = (chunk: Buffer, fd: 'stdout' | 'stderr') => {
-            const cleanChunk = stripAnsi(chunk + '')
-            if (
-              cleanChunk.match(
-                /(ENOENT|Module build failed|Module not found|Cannot find module|Can't resolve)/
-              )
-            ) {
-              if (startDir === dir) {
-                try {
-                  // check if start directory is still valid
-                  const result = findPagesDir(
-                    startDir,
-                    !!config?.experimental?.appDir
-                  )
-                  shouldFilter = !Boolean(result.pagesDir || result.appDir)
-                } catch (_) {
-                  shouldFilter = true
-                }
+      // A restarted worker must report its own config-derived opt-out.
+      serverTelemetrySettings = undefined
+      // Pipe output through us so it can be held while the menu is open.
+      child = fork(startServerPath, {
+        stdio: humanUpgrade ? ['inherit', 'pipe', 'pipe', 'ipc'] : 'inherit',
+        execArgv,
+        env: {
+          ...defaultEnv,
+          ...(humanUpgrade ? getPromptOutputEnv() : undefined),
+          ...(isTurbopack ? { TURBOPACK: process.env.TURBOPACK } : undefined),
+          __NEXT_DEV_SERVER: '1',
+          NEXT_PRIVATE_START_TIME: process.env.NEXT_PRIVATE_START_TIME,
+          NEXT_PRIVATE_WORKER: '1',
+          NEXT_PRIVATE_UPGRADE_PROMPT:
+            humanUpgrade && !upgradeOffered ? '1' : undefined,
+          NEXT_PRIVATE_ALLOWED_UPGRADE_RETRIES: Array.from(
+            allowedUpgradeRetries
+          ).join(','),
+          NEXT_PRIVATE_TRACE_ID: traceId,
+          NEXT_PRIVATE_ENABLED_FEATURES: JSON.stringify(enabledFeatures),
+          NEXT_PRIVATE_DEV_SPAN_ATTRS: JSON.stringify(devSpanAttrs),
+          NODE_EXTRA_CA_CERTS: startServerOptions.selfSignedCertificate
+            ? startServerOptions.selfSignedCertificate.rootCA
+            : defaultEnv.NODE_EXTRA_CA_CERTS,
+          NODE_OPTIONS: formattedNodeOptions,
+          // There is a node.js bug on MacOS which causes closing file watchers to be really slow.
+          // This limits the number of watchers x mitigate the issue.
+          // https://github.com/nodejs/node/issues/29949
+          WATCHPACK_WATCHER_LIMIT:
+            os.platform() === 'darwin' ? '20' : undefined,
+          // Enable CPU profiling if requested
+          ...(options.experimentalCpuProf
+            ? {
+                NEXT_CPU_PROF: '1',
+                NEXT_CPU_PROF_DIR: ensureProfilesDir(dir),
+                __NEXT_PRIVATE_CPU_PROFILE: 'dev-server',
               }
-              if (shouldFilter || startDir !== dir) {
-                shouldFilter = true
-                return
-              }
+            : undefined),
+          ...(process.env.NEXT_TURBOPACK_TRACING
+            ? { NEXT_TURBOPACK_TRACING: process.env.NEXT_TURBOPACK_TRACING }
+            : undefined),
+        },
+      })
+      if (humanUpgrade) {
+        promptOutput.attach(child)
+      }
+
+      child.on('message', (msg: any) => {
+        if (msg && typeof msg === 'object') {
+          if (
+            typeof msg.nextUpgradeRetryAllowed === 'string' &&
+            /^[a-f0-9]{64}$/.test(msg.nextUpgradeRetryAllowed)
+          ) {
+            allowedUpgradeRetries.add(msg.nextUpgradeRetryAllowed)
+          } else if (msg.nextUpgradeContext) {
+            const context = msg.nextUpgradeContext as UpgradeContext
+            distDir = context.distDir
+            serverTelemetrySettings = { disabled: msg.telemetryDisabled }
+            const initialAssessment =
+              msg.nextUpgradeAssessment !== undefined
+                ? Promise.resolve(msg.nextUpgradeAssessment)
+                : null
+            void offerUpgrade(
+              context,
+              initialAssessment,
+              msg.telemetryDisabled
+            ).catch(async (error) => {
+              console.error(error)
+              await handleSessionStop('SIGTERM', false)
+              process.exit(1)
+            })
+          } else if (msg.nextWorkerReady) {
+            child?.send({ nextWorkerOptions: startServerOptions })
+          } else if (msg.nextServerReady && !resolved) {
+            // Preserve opt-outs set by config already evaluated in the server child.
+            serverTelemetrySettings = { disabled: msg.telemetryDisabled }
+            if (msg.port) {
+              // Store the used port in case a random one was selected, so that
+              // it can be re-used on automatic dev server restarts.
+              port = parseInt(msg.port, 10)
             }
-            process[fd].write(chunk)
-          }
-
-          let resolveCleanup!: (cleanup: () => Promise<void>) => void
-          let cleanupPromise = new Promise<() => Promise<void>>((resolve) => {
-            resolveCleanup = resolve
-          })
-          const cleanupWrapper = async () => {
-            const promise = cleanupPromise
-            cleanupPromise = Promise.resolve(async () => {})
-            const cleanup = await promise
-            await cleanup()
-          }
-          cleanupFns.push(cleanupWrapper)
-          devServerTeardown = cleanupWrapper
-
-          try {
-            devServerOptions.onStdout = (chunk) => {
-              filterForkErrors(chunk, 'stdout')
+            if (msg.distDir) {
+              // Store the distDir from the child process for telemetry and trace uploads.
+              distDir = msg.distDir
             }
-            devServerOptions.onStderr = (chunk) => {
-              filterForkErrors(chunk, 'stderr')
-            }
-            shouldFilter = false
-            resolveCleanup(await startServer(devServerOptions))
-          } finally {
-            // fallback to noop, if not provided
-            resolveCleanup(async () => {})
-          }
 
-          if (!config) {
-            config = await loadConfig(
-              PHASE_DEVELOPMENT_SERVER,
-              dir,
-              undefined,
-              undefined,
-              true
-            )
-          }
-
-          if (config.experimental?.appDir && !devServerOptions.useWorkers) {
-            Log.error(
-              `Disabling dev workers is not supported with appDir enabled`
-            )
+            resolved = true
+            resolve()
           }
         }
+      })
 
-        await setupFork()
-        await preflight()
-
-        const parentDir = path.join('/', dir, '..')
-        const watchedEntryLength = parentDir.split('/').length + 1
-        const previousItems = new Set<string>()
-        const instrumentationFilePaths = !!config?.experimental
-          ?.instrumentationHook
-          ? getPossibleInstrumentationHookFilenames(dir, config.pageExtensions!)
-          : []
-
-        const instrumentationFileWatcher = new Watchpack({})
-        cleanupFns.push(() => instrumentationFileWatcher.close())
-
-        instrumentationFileWatcher.watch({
-          files: instrumentationFilePaths,
-          startTime: 0,
-        })
-
-        let instrumentationFileLastHash: string | undefined = undefined
-        const previousInstrumentationFiles = new Set<string>()
-        instrumentationFileWatcher.on('aggregated', async () => {
-          const knownFiles = instrumentationFileWatcher.getTimeInfoEntries()
-          const instrumentationFile = [...knownFiles.entries()].find(
-            ([key, value]) => instrumentationFilePaths.includes(key) && value
-          )?.[0]
-
-          if (instrumentationFile) {
-            const fs = require('fs') as typeof import('fs')
-            const instrumentationFileHash = (
-              require('crypto') as typeof import('crypto')
-            )
-              .createHash('sha256')
-              .update(await fs.promises.readFile(instrumentationFile, 'utf8'))
-              .digest('hex')
-
-            if (
-              instrumentationFileLastHash &&
-              instrumentationFileHash !== instrumentationFileLastHash
-            ) {
-              Log.warn(
-                `The instrumentation file has changed, restarting the server to apply changes.`
-              )
-              return setupFork()
-            } else {
-              if (
-                !instrumentationFileLastHash &&
-                previousInstrumentationFiles.size !== 0
-              ) {
-                Log.warn(
-                  'The instrumentation file was added, restarting the server to apply changes.'
-                )
-                return setupFork()
-              }
-              instrumentationFileLastHash = instrumentationFileHash
-            }
-          } else if (
-            [...previousInstrumentationFiles.keys()].find((key) =>
-              instrumentationFilePaths.includes(key)
-            )
-          ) {
-            Log.warn(
-              `The instrumentation file has been removed, restarting the server to apply changes.`
-            )
-            instrumentationFileLastHash = undefined
-            return setupFork()
-          }
-
-          previousInstrumentationFiles.clear()
-          knownFiles.forEach((_, key) => previousInstrumentationFiles.add(key))
-        })
-
-        const projectFolderWatcher = new Watchpack({
-          ignored: (entry: string) => {
-            return !(entry.split('/').length <= watchedEntryLength)
-          },
-        })
-        cleanupFns.push(() => projectFolderWatcher.close())
-
-        projectFolderWatcher.watch({ directories: [parentDir], startTime: 0 })
-
-        projectFolderWatcher.on('aggregated', async () => {
-          const knownFiles = projectFolderWatcher.getTimeInfoEntries()
-          const newFiles: string[] = []
-          let hasPagesApp = false
-
-          // if the dir still exists nothing to check
-          try {
-            const result = findPagesDir(dir, !!config?.experimental?.appDir)
-            hasPagesApp = Boolean(result.pagesDir || result.appDir)
-          } catch (err) {
-            // if findPagesDir throws validation error let this be
-            // handled in the dev-server itself in the fork
-            if ((err as any).message?.includes('experimental')) {
-              return
-            }
-          }
-
-          // try to find new dir introduced
-          if (previousItems.size) {
-            for (const key of knownFiles.keys()) {
-              if (!previousItems.has(key)) {
-                newFiles.push(key)
-              }
-            }
-            previousItems.clear()
-          }
-
-          for (const key of knownFiles.keys()) {
-            previousItems.add(key)
-          }
-
-          if (hasPagesApp) {
+      // A restart replaces `child`, so keep this one.
+      const worker = child
+      worker.on('exit', async (code, signal) => {
+        reassertRawMode()
+        // Read the rest of its output first. A restart keeps the menu open.
+        await drainPromptOutput(worker)
+        if (sessionStopHandled) {
+          return
+        }
+        if (signal) {
+          if (upgradeInProgress) {
+            interruption ??= signal
+            await handleSessionStop(null)
             return
           }
-
-          // if we failed to find the new dir it may have been moved
-          // to a new parent directory which we can't track as easily
-          // so exit gracefully
-          try {
-            const result = findPagesDir(
-              newFiles[0],
-              !!config?.experimental?.appDir
-            )
-            hasPagesApp = Boolean(result.pagesDir || result.appDir)
-          } catch (_) {}
-
-          if (hasPagesApp && newFiles.length === 1) {
-            Log.info(
-              `Detected project directory rename, restarting in new location`
-            )
-            setupFork(newFiles[0])
-            watchConfigFiles(newFiles[0])
-          } else {
+          // Shutdowns initiated by this process returned above. The server
+          // handles SIGINT/SIGTERM itself and exits with a code, so a signal
+          // exit here means it was killed externally (e.g. by the OOM killer)
+          // or crashed. Stop instead of running on without a server.
+          // Termination requests (e.g. Ctrl+C before the server installed its
+          // handlers) are not errors, so only report other signals.
+          if (
+            signal !== 'SIGINT' &&
+            signal !== 'SIGTERM' &&
+            signal !== 'SIGHUP'
+          ) {
             Log.error(
-              `Project directory could not be found, restart Next.js in your new directory`
+              `The Next.js dev server process exited unexpectedly due to signal ${signal}.` +
+                (signal === 'SIGKILL'
+                  ? ' This can happen when the system runs out of memory.'
+                  : '')
             )
-            process.exit(0)
           }
+          childExitSignal = signal
+          await handleSessionStop(/* signal */ null)
+          return
+        }
+        if (code === RESTART_EXIT_CODE) {
+          // Starting the dev server will overwrite the `.next/trace` file, so we
+          // must upload the existing contents before restarting the server to
+          // preserve the metrics.
+          if (traceUploadUrl && distDir) {
+            uploadTrace({
+              traceUploadUrl,
+              mode: 'dev',
+              projectDir: dir,
+              distDir,
+              isTurboSession: isTurbopack,
+              sync: true,
+            })
+          }
+
+          // Reset the start time so "Ready in X" reflects the restart
+          // duration, not time since the original process started.
+          process.env.NEXT_PRIVATE_START_TIME = Date.now().toString()
+
+          return startServer({ ...startServerOptions, port })
+        }
+        // Call handler (e.g. upload telemetry). Don't try to send a signal to
+        // the child, as it has already exited.
+        await handleSessionStop(/* signal */ null)
+      })
+    })
+  }
+
+  const runDevServer = async (reboot: boolean) => {
+    try {
+      if (!!options.experimentalHttps) {
+        Log.warn(
+          'Self-signed certificates are currently an experimental feature, use with caution.'
+        )
+
+        let certificate: SelfSignedCertificate | undefined
+
+        const key = options.experimentalHttpsKey
+        const cert = options.experimentalHttpsCert
+        const rootCA = options.experimentalHttpsCa
+
+        if (key && cert) {
+          certificate = {
+            key: path.resolve(key),
+            cert: path.resolve(cert),
+            rootCA: rootCA ? path.resolve(rootCA) : undefined,
+          }
+        } else {
+          certificate = await createSelfSignedCertificate(host)
+        }
+
+        await startServer({
+          ...devServerOptions,
+          selfSignedCertificate: certificate,
         })
-      } catch (err) {
-        console.error(err)
-        process.exit(1)
+      } else {
+        await startServer(devServerOptions)
+      }
+
+      // Its warnings would land on the menu's screen and be lost.
+      await upgradeMenu
+      await preflight(reboot)
+    } catch (err) {
+      console.error(err)
+      process.exit(1)
+    }
+  }
+
+  await runDevServer(false)
+}
+
+function writeDevState(): void {
+  if (!traceUploadUrl || !dir) return
+  try {
+    fs.mkdirSync(path.dirname(DEV_STATE_FILE), { recursive: true })
+
+    let state: Record<string, DevStateEntry> = {}
+    try {
+      state = JSON.parse(fs.readFileSync(DEV_STATE_FILE, 'utf8'))
+    } catch {
+      // File missing or corrupt — start with empty state
+    }
+
+    // Eagerly remove entries that are stale (older than threshold) or invalid
+    // (future timestamps from clock skew or corruption).
+    const now = Date.now()
+    const cutoff = now - RAGE_RESTART_THRESHOLD_MS
+    for (const key of Object.keys(state)) {
+      const t = state[key]?.stopTime
+      if (!t || t < cutoff || t > now) {
+        delete state[key]
       }
     }
-    await runDevServer()
+
+    // Update current project
+    const gitBranch = getGitBranch(dir)
+    state[dir] = {
+      stopTime: Date.now(),
+      distDirPath: path.join(dir, distDir ?? '.next'),
+      ...(gitBranch ? { gitBranch } : {}),
+    }
+
+    const { sync: writeFileAtomicSync } =
+      require('next/dist/compiled/write-file-atomic') as typeof import('next/dist/compiled/write-file-atomic')
+    writeFileAtomicSync(DEV_STATE_FILE, JSON.stringify(state))
+  } catch {
+    // Best effort — don't interfere with shutdown
   }
 }
 

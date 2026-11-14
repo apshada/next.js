@@ -1,62 +1,72 @@
-import { createNextDescribe } from 'e2e-utils'
-import { getRedboxDescription, hasRedbox } from 'next-test-utils'
+import { nextTestSetup } from 'e2e-utils'
 
-createNextDescribe(
-  'dynamic-href',
-  {
+describe('dynamic-href', () => {
+  const { isNextDev: isDev, next } = nextTestSetup({
     files: __dirname,
-    skipDeployment: true,
-  },
-  ({ isNextDev: isDev, next }) => {
-    if (isDev) {
-      it('should error when using dynamic href.pathname in app dir', async () => {
-        const browser = await next.browser('/object')
+  })
 
-        // Error should show up
-        expect(await hasRedbox(browser, true)).toBeTrue()
-        expect(await getRedboxDescription(browser)).toMatchInlineSnapshot(
-          `"Error: Dynamic href \`/object/[slug]\` found in <Link> while using the \`/app\` router, this is not supported. Read more: https://nextjs.org/docs/messages/app-dir-dynamic-href"`
-        )
+  if (isDev) {
+    it('should error when using dynamic href.pathname in app dir', async () => {
+      const browser = await next.browser('/object')
 
-        // Fix error
-        const pageContent = await next.readFile('app/object/page.js')
-        await next.patchFile(
-          'app/object/page.js',
-          pageContent.replace(
-            "pathname: '/object/[slug]'",
-            "pathname: '/object/slug'"
-          )
-        )
-        expect(await browser.waitForElementByCss('#link').text()).toBe(
-          'to slug'
-        )
+      await expect(browser).toDisplayRedbox(`
+       {
+         "description": "Dynamic href \`/object/[slug]\` found in <Link> while using the \`/app\` router, this is not supported. Read more: https://nextjs.org/docs/messages/app-dir-dynamic-href",
+         "environmentLabel": null,
+         "label": "Runtime Error",
+         "source": "app/object/page.js (5:5) @ HomePage
+       > 5 |     <Link
+           |     ^",
+         "stack": [
+           "HomePage app/object/page.js (5:5)",
+         ],
+       }
+      `)
 
-        // Navigate to new page
-        await browser.elementByCss('#link').click()
-        expect(await browser.waitForElementByCss('#pathname').text()).toBe(
-          '/object/slug'
+      // Fix error
+      const pageContent = await next.readFile('app/object/page.js')
+      await next.patchFile(
+        'app/object/page.js',
+        pageContent.replace(
+          "pathname: '/object/[slug]'",
+          "pathname: '/object/slug'"
         )
-        expect(await browser.elementByCss('#slug').text()).toBe('1')
-      })
+      )
+      expect(await browser.waitForElementByCss('#link').text()).toBe('to slug')
 
-      it('should error when using dynamic href in app dir', async () => {
-        const browser = await next.browser('/string')
+      // Navigate to new page
+      await browser.elementByCss('#link').click()
+      expect(await browser.waitForElementByCss('#pathname').text()).toBe(
+        '/object/slug'
+      )
+      expect(await browser.elementByCss('#slug').text()).toBe('1')
+    })
 
-        // Error should show up
-        expect(await hasRedbox(browser, true)).toBeTrue()
-        expect(await getRedboxDescription(browser)).toMatchInlineSnapshot(
-          `"Error: Dynamic href \`/object/[slug]\` found in <Link> while using the \`/app\` router, this is not supported. Read more: https://nextjs.org/docs/messages/app-dir-dynamic-href"`
-        )
-      })
-    } else {
-      it('should not error on /object in prod', async () => {
-        const browser = await next.browser('/object')
-        expect(await browser.elementByCss('#link').text()).toBe('to slug')
-      })
-      it('should not error on /string in prod', async () => {
-        const browser = await next.browser('/string')
-        expect(await browser.elementByCss('#link').text()).toBe('to slug')
-      })
-    }
+    it('should error when using dynamic href in app dir', async () => {
+      const browser = await next.browser('/string')
+
+      await expect(browser).toDisplayRedbox(`
+       {
+         "description": "Dynamic href \`/object/[slug]\` found in <Link> while using the \`/app\` router, this is not supported. Read more: https://nextjs.org/docs/messages/app-dir-dynamic-href",
+         "environmentLabel": null,
+         "label": "Runtime Error",
+         "source": "app/string/page.js (5:5) @ HomePage
+       > 5 |     <Link id="link" href="/object/[slug]">
+           |     ^",
+         "stack": [
+           "HomePage app/string/page.js (5:5)",
+         ],
+       }
+      `)
+    })
+  } else {
+    it('should not error on /object in prod', async () => {
+      const browser = await next.browser('/object')
+      expect(await browser.elementByCss('#link').text()).toBe('to slug')
+    })
+    it('should not error on /string in prod', async () => {
+      const browser = await next.browser('/string')
+      expect(await browser.elementByCss('#link').text()).toBe('to slug')
+    })
   }
-)
+})

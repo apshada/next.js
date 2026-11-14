@@ -197,12 +197,25 @@ it('consider 127.0.0.1 and variations as localhost', () => {
   const httpUrl = new NextURL('http://localhost:3000/hello')
   expect(new NextURL('http://127.0.0.1:3000/hello')).toStrictEqual(httpUrl)
   expect(new NextURL('http://127.0.1.0:3000/hello')).toStrictEqual(httpUrl)
-  expect(new NextURL('http://::1:3000/hello')).toStrictEqual(httpUrl)
+  expect(new NextURL('http://[::1]:3000/hello')).toStrictEqual(httpUrl)
 
   const httpsUrl = new NextURL('https://localhost:3000/hello')
   expect(new NextURL('https://127.0.0.1:3000/hello')).toStrictEqual(httpsUrl)
   expect(new NextURL('https://127.0.1.0:3000/hello')).toStrictEqual(httpsUrl)
-  expect(new NextURL('https://::1:3000/hello')).toStrictEqual(httpsUrl)
+  expect(new NextURL('https://[::1]:3000/hello')).toStrictEqual(httpsUrl)
+})
+
+it('preserves loopback hostnames inside encoded query parameter values', () => {
+  const url = new NextURL(
+    'https://example.com/api/echo?redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Ftest'
+  )
+
+  expect(url.searchParams.get('redirect_uri')).toEqual(
+    'http://127.0.0.1:12345/test'
+  )
+  expect(url.href).toEqual(
+    'https://example.com/api/echo?redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Ftest'
+  )
 })
 
 it('allows to change the port', () => {

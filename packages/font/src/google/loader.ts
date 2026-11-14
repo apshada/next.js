@@ -95,7 +95,7 @@ const nextFontGoogleFontLoader: FontLoader = async ({
     }
 
     // CSS Variables may be set on a body tag, ignore them to keep the CSS module pure
-    fontFaceDeclarations = fontFaceDeclarations.split('body {')[0]
+    fontFaceDeclarations = fontFaceDeclarations.split('body {', 1)[0]
 
     // Find font files to download, provide the array of subsets we want to preload if preloading is enabled
     const fontFiles = findFontFilesInCss(
@@ -105,7 +105,7 @@ const nextFontGoogleFontLoader: FontLoader = async ({
 
     // Download the font files extracted from the CSS
     const downloadedFiles = await Promise.all(
-      fontFiles.map(async ({ googleFontFileUrl, preloadFontFile }) => {
+      fontFiles.map(async ({ googleFontFileUrl, preloadFontFile, ext }) => {
         const hasCachedFont = fontCache.has(googleFontFileUrl)
         // Download the font file or get it from cache
         const fontFileBuffer = hasCachedFont
@@ -123,7 +123,6 @@ const nextFontGoogleFontLoader: FontLoader = async ({
           nextFontError(`Failed to fetch \`${fontFamily}\` from Google Fonts.`)
         }
 
-        const ext = /\.(woff|woff2|eot|ttf|otf)$/.exec(googleFontFileUrl)![1]
         // Emit font file to .next/static/media
         const selfHostedFileUrl = emitFontFile(
           fontFileBuffer,
@@ -164,7 +163,9 @@ const nextFontGoogleFontLoader: FontLoader = async ({
     if (isDev) {
       if (isServer) {
         Log.error(
-          `Failed to download \`${fontFamily}\` from Google Fonts. Using fallback font instead.`
+          `Failed to download \`${fontFamily}\` from Google Fonts. Using fallback font instead.\n\n${
+            (err as Error).message
+          }}`
         )
       }
 

@@ -1,6 +1,12 @@
-module.exports = {
-  strictMode: true,
+/**
+ * @type {import('next').NextConfig}
+ */
+const config = {
   experimental: {
-    appDir: true,
+    instantInsights: {
+      validationLevel: 'manual-warning',
+    },
   },
 }
+
+module.exports = config

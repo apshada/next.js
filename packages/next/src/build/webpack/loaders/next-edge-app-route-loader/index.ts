@@ -1,14 +1,57 @@
 import { getModuleBuildInfo } from '../get-module-build-info'
 import { stringifyRequest } from '../../stringify-request'
-import { NextConfig } from '../../../../server/config-shared'
-import { webpack } from 'next/dist/compiled/webpack/webpack'
+import type { webpack } from 'next/dist/compiled/webpack/webpack'
+import { WEBPACK_RESOURCE_QUERIES } from '../../../../lib/constants'
+import type { ProxyConfig } from '../../../analysis/get-page-static-info'
+import { loadEntrypoint } from '../../../load-entrypoint'
+import { isMetadataRoute } from '../../../../lib/metadata/is-metadata-route'
 
 export type EdgeAppRouteLoaderQuery = {
   absolutePagePath: string
   page: string
   appDirLoader: string
   preferredRegion: string | string[] | undefined
-  nextConfigOutput: NextConfig['output']
+  middlewareConfig: string
+  cacheHandler?: string
+  cacheHandlers: string
+}
+
+function getCacheHandlersSetup(
+  cacheHandlersStringified: string,
+  contextifyImportPath: (path: string) => string
+): {
+  cacheHandlerImports: string
+  edgeCacheHandlersRegistration: string
+} {
+  const cacheHandlers = JSON.parse(cacheHandlersStringified || '{}') as Record<
+    string,
+    string | undefined
+  >
+  const definedCacheHandlers = Object.entries(cacheHandlers).filter(
+    (entry): entry is [string, string] => Boolean(entry[1])
+  )
+
+  const cacheHandlerImports: string[] = []
+  const edgeCacheHandlersRegistration: string[] = []
+
+  for (const [index, [kind, handlerPath]] of definedCacheHandlers.entries()) {
+    const cacheHandlerVarName = `edgeCacheHandler_${index}`
+    const cacheHandlerImportPath = contextifyImportPath(handlerPath)
+    cacheHandlerImports.push(
+      `import ${cacheHandlerVarName} from ${JSON.stringify(
+        cacheHandlerImportPath
+      )}`
+    )
+    edgeCacheHandlersRegistration.push(
+      `edgeCacheHandlers[${JSON.stringify(kind)}] = ${cacheHandlerVarName}`
+    )
+  }
+
+  return {
+    cacheHandlerImports: cacheHandlerImports.join('\n') || '\n',
+    edgeCacheHandlersRegistration:
+      edgeCacheHandlersRegistration.join('\n') || '\n',
+  }
 }
 
 const EdgeAppRouteLoader: webpack.LoaderDefinitionFunction<EdgeAppRouteLoaderQuery> =
@@ -18,9 +61,24 @@ const EdgeAppRouteLoader: webpack.LoaderDefinitionFunction<EdgeAppRouteLoaderQue
       absolutePagePath,
       preferredRegion,
       appDirLoader: appDirLoaderBase64 = '',
+      middlewareConfig: middlewareConfigBase64 = '',
+      cacheHandler,
+      cacheHandlers: cacheHandlersStringified,
     } = this.getOptions()
 
     const appDirLoader = Buffer.from(appDirLoaderBase64, 'base64').toString()
+    const middlewareConfig: ProxyConfig = JSON.parse(
+      Buffer.from(middlewareConfigBase64, 'base64').toString()
+    )
+
+    const cacheHandlersSetup = getCacheHandlersSetup(
+      cacheHandlersStringified,
+      (handlerPath) =>
+        this.utils.contextify(this.context || this.rootContext, handlerPath)
+    )
+    const incrementalCacheHandler = cacheHandler
+      ? this.utils.contextify(this.context || this.rootContext, cacheHandler)
+      : null
 
     // Ensure we only run this loader for as a module.
     if (!this._module) throw new Error('This loader is only usable as a module')
@@ -28,7 +86,7 @@ const EdgeAppRouteLoader: webpack.LoaderDefinitionFunction<EdgeAppRouteLoaderQue
     const buildInfo = getModuleBuildInfo(this._module)
 
     buildInfo.nextEdgeSSR = {
-      isServerComponent: false,
+      isServerComponent: !isMetadataRoute(page), // Needed for 'use cache'.
       page: page,
       isAppDir: true,
     }
@@ -36,21 +94,26 @@ const EdgeAppRouteLoader: webpack.LoaderDefinitionFunction<EdgeAppRouteLoaderQue
       page,
       absolutePagePath,
       preferredRegion,
+      middlewareConfig,
     }
 
     const stringifiedPagePath = stringifyRequest(this, absolutePagePath)
     const modulePath = `${appDirLoader}${stringifiedPagePath.substring(
       1,
       stringifiedPagePath.length - 1
-    )}?__edge_ssr_entry__`
+    )}?${WEBPACK_RESOURCE_QUERIES.edgeSSREntry}`
 
-    return `
-    import { EdgeRouteModuleWrapper } from 'next/dist/esm/server/web/edge-route-module-wrapper'
-    import * as module from ${JSON.stringify(modulePath)}
-
-    export const ComponentMod = module
-
-    export default EdgeRouteModuleWrapper.wrap(module.routeModule)`
+    return await loadEntrypoint(
+      'edge-app-route',
+      {
+        VAR_USERLAND: modulePath,
+        VAR_PAGE: page,
+      },
+      cacheHandlersSetup,
+      {
+        incrementalCacheHandler,
+      }
+    )
   }
 
 export default EdgeAppRouteLoader

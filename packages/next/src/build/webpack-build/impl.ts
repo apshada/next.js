@@ -1,19 +1,25 @@
+// Import cpu-profile first to start profiling early if enabled
+import { saveCpuProfile } from '../../server/lib/cpu-profile'
 import type { webpack } from 'next/dist/compiled/webpack/webpack'
-import chalk from 'next/dist/compiled/chalk'
-import formatWebpackMessages from '../../client/dev/error-overlay/format-webpack-messages'
+import { stringBufferUtils } from 'next/dist/compiled/webpack-sources3'
+import { red } from '../../lib/picocolors'
+import formatWebpackMessages from '../../shared/lib/format-webpack-messages'
 import { nonNullable } from '../../lib/non-nullable'
+import type { COMPILER_INDEXES } from '../../shared/lib/constants'
 import {
   COMPILER_NAMES,
   CLIENT_STATIC_FILES_RUNTIME_MAIN_APP,
   APP_CLIENT_INTERNALS,
   PHASE_PRODUCTION_BUILD,
-  COMPILER_INDEXES,
 } from '../../shared/lib/constants'
 import { runCompiler } from '../compiler'
 import * as Log from '../output/log'
 import getBaseWebpackConfig, { loadProjectInfo } from '../webpack-config'
-import { NextError } from '../../lib/is-error'
-import { TelemetryPlugin } from '../webpack/plugins/telemetry-plugin'
+import type { NextError } from '../../lib/is-error'
+import {
+  TelemetryPlugin,
+  type TelemetryPluginState,
+} from '../webpack/plugins/telemetry-plugin/telemetry-plugin'
 import {
   NextBuildContext,
   resumePluginState,
@@ -21,16 +27,24 @@ import {
 } from '../build-context'
 import { createEntrypoints } from '../entries'
 import loadConfig from '../../server/config'
-import { trace } from '../../trace'
-import { WEBPACK_LAYERS } from '../../lib/constants'
 import {
-  TraceEntryPointsPlugin,
-  TurbotraceContext,
-} from '../webpack/plugins/next-trace-entrypoints-plugin'
-import { UnwrapPromise } from '../../lib/coalesced-function'
-import * as pagesPluginModule from '../webpack/plugins/pages-manifest-plugin'
+  getTraceEvents,
+  initializeTraceState,
+  setGlobal,
+  trace,
+  type TraceEvent,
+  type TraceState,
+} from '../../trace'
+import { WEBPACK_LAYERS } from '../../lib/constants'
+import { TraceEntryPointsPlugin } from '../webpack/plugins/next-trace-entrypoints-plugin'
+import type { BuildTraceContext } from '../webpack/plugins/next-trace-entrypoints-plugin'
+import type { UnwrapPromise } from '../../lib/coalesced-function'
 
 import origDebug from 'next/dist/compiled/debug'
+import { Telemetry } from '../../telemetry/storage'
+import { durationToString, hrtimeToSeconds } from '../duration-to-string'
+import { installBindings } from '../swc/install-bindings'
+import { Bundler } from '../../lib/bundler'
 
 const debug = origDebug('next:build:webpack-build')
 
@@ -57,12 +71,12 @@ function isTraceEntryPointsPlugin(
 }
 
 export async function webpackBuildImpl(
-  compilerName?: keyof typeof COMPILER_INDEXES
+  compilerName: keyof typeof COMPILER_INDEXES | null
 ): Promise<{
   duration: number
   pluginState: any
-  turbotraceContext?: TurbotraceContext
-  serializedPagesManifestEntries?: typeof NextBuildContext['serializedPagesManifestEntries']
+  buildTraceContext?: BuildTraceContext
+  telemetryState?: TelemetryPluginState
 }> {
   let result: CompilerResult | null = {
     warnings: [],
@@ -73,8 +87,15 @@ export async function webpackBuildImpl(
   const nextBuildSpan = NextBuildContext.nextBuildSpan!
   const dir = NextBuildContext.dir!
   const config = NextBuildContext.config!
+  process.env.NEXT_COMPILER_NAME = compilerName || 'server'
 
   const runWebpackSpan = nextBuildSpan.traceChild('run-webpack-compiler')
+
+  const hasDeferredEntries =
+    config.experimental.deferredEntries &&
+    config.experimental.deferredEntries.length > 0
+
+  // Create entrypoints - exclude deferred entries if configured
   const entrypoints = await nextBuildSpan
     .traceChild('create-entrypoints')
     .traceAsyncFn(() =>
@@ -89,25 +110,51 @@ export async function webpackBuildImpl(
         appDir: NextBuildContext.appDir!,
         pages: NextBuildContext.mappedPages!,
         appPaths: NextBuildContext.mappedAppPages!,
+        appDefaultPaths: NextBuildContext.mappedAppDefaults,
         previewMode: NextBuildContext.previewProps!,
         rootPaths: NextBuildContext.mappedRootPaths!,
         hasInstrumentationHook: NextBuildContext.hasInstrumentationHook!,
+        deferredEntriesFilter: hasDeferredEntries ? 'exclude' : undefined,
       })
     )
 
+  // Create deferred entrypoints if configured
+  const deferredEntrypoints = hasDeferredEntries
+    ? await nextBuildSpan
+        .traceChild('create-deferred-entrypoints')
+        .traceAsyncFn(() =>
+          createEntrypoints({
+            buildId: NextBuildContext.buildId!,
+            config: config,
+            envFiles: NextBuildContext.loadedEnvFiles!,
+            isDev: false,
+            rootDir: dir,
+            pageExtensions: config.pageExtensions!,
+            pagesDir: NextBuildContext.pagesDir!,
+            appDir: NextBuildContext.appDir!,
+            pages: NextBuildContext.mappedPages!,
+            appPaths: NextBuildContext.mappedAppPages!,
+            appDefaultPaths: NextBuildContext.mappedAppDefaults,
+            previewMode: NextBuildContext.previewProps!,
+            rootPaths: NextBuildContext.mappedRootPaths!,
+            hasInstrumentationHook: NextBuildContext.hasInstrumentationHook!,
+            deferredEntriesFilter: 'only',
+          })
+        )
+    : null
+
   const commonWebpackOptions = {
     isServer: false,
+    isCompileMode: NextBuildContext.isCompileMode,
     buildId: NextBuildContext.buildId!,
+    encryptionKey: NextBuildContext.encryptionKey!,
     config: config,
     appDir: NextBuildContext.appDir!,
     pagesDir: NextBuildContext.pagesDir!,
     rewrites: NextBuildContext.rewrites!,
-    originalRewrites: NextBuildContext.originalRewrites,
-    originalRedirects: NextBuildContext.originalRedirects,
-    reactProductionProfiling: NextBuildContext.reactProductionProfiling!,
     noMangling: NextBuildContext.noMangling!,
     clientRouterFilters: NextBuildContext.clientRouterFilters!,
-    previewModeId: NextBuildContext.previewModeId!,
+    previewProps: NextBuildContext.previewProps!,
     allowedRevalidateHeaderKeys: NextBuildContext.allowedRevalidateHeaderKeys!,
     fetchCacheKeyPrefix: NextBuildContext.fetchCacheKeyPrefix!,
   }
@@ -127,6 +174,9 @@ export async function webpackBuildImpl(
           runWebpackSpan,
           compilerType: COMPILER_NAMES.client,
           entrypoints: entrypoints.client,
+          deferredEntrypoints: deferredEntrypoints?.client,
+          deferredEntrySourceDirectories:
+            deferredEntrypoints?.entrySourceDirectories,
           ...info,
         }),
         getBaseWebpackConfig(dir, {
@@ -135,6 +185,9 @@ export async function webpackBuildImpl(
           middlewareMatchers: entrypoints.middlewareMatchers,
           compilerType: COMPILER_NAMES.server,
           entrypoints: entrypoints.server,
+          deferredEntrypoints: deferredEntrypoints?.server,
+          deferredEntrySourceDirectories:
+            deferredEntrypoints?.entrySourceDirectories,
           ...info,
         }),
         getBaseWebpackConfig(dir, {
@@ -143,6 +196,9 @@ export async function webpackBuildImpl(
           middlewareMatchers: entrypoints.middlewareMatchers,
           compilerType: COMPILER_NAMES.edgeServer,
           entrypoints: entrypoints.edgeServer,
+          deferredEntrypoints: deferredEntrypoints?.edgeServer,
+          deferredEntrySourceDirectories:
+            deferredEntrypoints?.entrySourceDirectories,
           ...info,
         }),
       ])
@@ -150,6 +206,7 @@ export async function webpackBuildImpl(
 
   const clientConfig = configs[0]
   const serverConfig = configs[1]
+  const edgeConfig = configs[2]
 
   if (
     clientConfig.optimization &&
@@ -167,29 +224,42 @@ export async function webpackBuildImpl(
   debug(`starting compiler`, compilerName)
   // We run client and server compilation separately to optimize for memory usage
   await runWebpackSpan.traceAsyncFn(async () => {
+    if (config.experimental.webpackMemoryOptimizations) {
+      stringBufferUtils.disableDualStringBufferCaching()
+      stringBufferUtils.enterStringInterningRange()
+    }
+
     // Run the server compilers first and then the client
     // compiler to track the boundary of server/client components.
     let clientResult: SingleCompilerResult | null = null
 
     // During the server compilations, entries of client components will be
     // injected to this set and then will be consumed by the client compiler.
-    let serverResult: UnwrapPromise<ReturnType<typeof runCompiler>> | null =
+    let serverResult: UnwrapPromise<ReturnType<typeof runCompiler>>[0] | null =
       null
-    let edgeServerResult: UnwrapPromise<ReturnType<typeof runCompiler>> | null =
-      null
+    let edgeServerResult:
+      | UnwrapPromise<ReturnType<typeof runCompiler>>[0]
+      | null = null
+
+    let inputFileSystem: webpack.Compiler['inputFileSystem'] | undefined
 
     if (!compilerName || compilerName === 'server') {
-      serverResult = await runCompiler(serverConfig, {
+      debug('starting server compiler')
+      const start = Date.now()
+      ;[serverResult, inputFileSystem] = await runCompiler(serverConfig, {
         runWebpackSpan,
+        inputFileSystem,
       })
-      debug('server result', serverResult)
+      debug(`server compiler finished ${Date.now() - start}ms`)
     }
 
     if (!compilerName || compilerName === 'edge-server') {
-      edgeServerResult = configs[2]
-        ? await runCompiler(configs[2], { runWebpackSpan })
-        : null
-      debug('edge server result', edgeServerResult)
+      debug('starting edge-server compiler')
+      const start = Date.now()
+      ;[edgeServerResult, inputFileSystem] = edgeConfig
+        ? await runCompiler(edgeConfig, { runWebpackSpan, inputFileSystem })
+        : [null]
+      debug(`edge-server compiler finished ${Date.now() - start}ms`)
     }
 
     // Only continue if there were no errors
@@ -206,40 +276,44 @@ export async function webpackBuildImpl(
               ...clientEntry[CLIENT_STATIC_FILES_RUNTIME_MAIN_APP].import,
               value,
             ],
-            layer: WEBPACK_LAYERS.appClient,
+            layer: WEBPACK_LAYERS.appPagesBrowser,
           }
         } else {
           clientEntry[key] = {
             dependOn: [CLIENT_STATIC_FILES_RUNTIME_MAIN_APP],
             import: value,
-            layer: WEBPACK_LAYERS.appClient,
+            layer: WEBPACK_LAYERS.appPagesBrowser,
           }
         }
       }
 
       if (!compilerName || compilerName === 'client') {
-        clientResult = await runCompiler(clientConfig, {
+        debug('starting client compiler')
+        const start = Date.now()
+        ;[clientResult, inputFileSystem] = await runCompiler(clientConfig, {
           runWebpackSpan,
+          inputFileSystem,
         })
-        debug('client result', clientResult)
+        debug(`client compiler finished ${Date.now() - start}ms`)
       }
     }
 
+    if (config.experimental.webpackMemoryOptimizations) {
+      stringBufferUtils.exitStringInterningRange()
+    }
+    inputFileSystem?.purge?.()
+
     result = {
-      warnings: ([] as any[])
-        .concat(
-          clientResult?.warnings,
-          serverResult?.warnings,
-          edgeServerResult?.warnings
-        )
-        .filter(nonNullable),
-      errors: ([] as any[])
-        .concat(
-          clientResult?.errors,
-          serverResult?.errors,
-          edgeServerResult?.errors
-        )
-        .filter(nonNullable),
+      warnings: [
+        ...(clientResult?.warnings ?? []),
+        ...(serverResult?.warnings ?? []),
+        ...(edgeServerResult?.warnings ?? []),
+      ].filter(nonNullable),
+      errors: [
+        ...(clientResult?.errors ?? []),
+        ...(serverResult?.errors ?? []),
+        ...(edgeServerResult?.errors ?? []),
+      ].filter(nonNullable),
       stats: [
         clientResult?.stats,
         serverResult?.stats,
@@ -251,9 +325,9 @@ export async function webpackBuildImpl(
     .traceChild('format-webpack-messages')
     .traceFn(() => formatWebpackMessages(result, true)) as CompilerResult
 
-  NextBuildContext.telemetryPlugin = (
-    clientConfig as webpack.Configuration
-  ).plugins?.find(isTelemetryPlugin)
+  const telemetryPlugin = (clientConfig as webpack.Configuration).plugins?.find(
+    isTelemetryPlugin
+  )
 
   const traceEntryPointsPlugin = (
     serverConfig as webpack.Configuration
@@ -269,7 +343,7 @@ export async function webpackBuildImpl(
     }
     let error = result.errors.filter(Boolean).join('\n\n')
 
-    console.error(chalk.red('Failed to compile.\n'))
+    console.error(red('Failed to compile.\n'))
 
     if (
       error.indexOf('private-next-pages') > -1 &&
@@ -296,28 +370,32 @@ export async function webpackBuildImpl(
       err.code = 'INVALID_RESOLVE_ALIAS'
       throw err
     }
-    const err = new Error('Build failed because of webpack errors') as NextError
+    const err = new Error(
+      `Build failed because of ${process.env.NEXT_RSPACK ? 'Rspack' : 'webpack'} errors`
+    ) as NextError
     err.code = 'WEBPACK_ERRORS'
     throw err
   } else {
+    const duration = hrtimeToSeconds(webpackBuildEnd)
+    const durationString = durationToString(duration)
+
     if (result.warnings.length > 0) {
-      Log.warn('Compiled with warnings\n')
+      Log.warn(`Compiled with warnings in ${durationString}\n`)
       console.warn(result.warnings.filter(Boolean).join('\n\n'))
       console.warn()
     } else if (!compilerName) {
-      NextBuildContext.buildSpinner?.stopAndPersist()
-      Log.info('Compiled successfully')
+      Log.event(`Compiled successfully in ${durationString}`)
     }
 
     return {
-      duration: webpackBuildEnd[0],
-      turbotraceContext: traceEntryPointsPlugin?.turbotraceContext,
+      duration,
+      buildTraceContext: traceEntryPointsPlugin?.buildTraceContext,
       pluginState: getPluginState(),
-      serializedPagesManifestEntries: {
-        edgeServerPages: pagesPluginModule.edgeServerPages,
-        edgeServerAppPaths: pagesPluginModule.edgeServerAppPaths,
-        nodeServerPages: pagesPluginModule.nodeServerPages,
-        nodeServerAppPaths: pagesPluginModule.nodeServerAppPaths,
+      telemetryState: {
+        usages: telemetryPlugin?.usages() || [],
+        packagesUsedInServerSideProps:
+          telemetryPlugin?.packagesUsedInServerSideProps() || [],
+        useCacheTracker: telemetryPlugin?.getUseCacheTracker() || {},
       },
     }
   }
@@ -327,45 +405,62 @@ export async function webpackBuildImpl(
 export async function workerMain(workerData: {
   compilerName: keyof typeof COMPILER_INDEXES
   buildContext: typeof NextBuildContext
-}) {
+  traceState: TraceState
+}): Promise<
+  Awaited<ReturnType<typeof webpackBuildImpl>> & {
+    debugTraceEvents: TraceEvent[]
+  }
+> {
+  // Clone the telemetry for worker
+  const telemetry = new Telemetry({
+    distDir: workerData.buildContext.distDir!,
+  })
+  setGlobal('telemetry', telemetry)
   // setup new build context from the serialized data passed from the parent
   Object.assign(NextBuildContext, workerData.buildContext)
+
+  // Initialize tracer state from the parent
+  initializeTraceState(workerData.traceState)
 
   // Resume plugin state
   resumePluginState(NextBuildContext.pluginState)
 
-  // restore module scope maps for flight plugins
-  const { serializedPagesManifestEntries } = NextBuildContext
-
-  for (const key of Object.keys(serializedPagesManifestEntries || {})) {
-    Object.assign(
-      (pagesPluginModule as any)[key],
-      (serializedPagesManifestEntries as any)?.[key]
-    )
-  }
-
   /// load the config because it's not serializable
-  NextBuildContext.config = await loadConfig(
+  const config = (NextBuildContext.config = await loadConfig(
     PHASE_PRODUCTION_BUILD,
     NextBuildContext.dir!,
-    undefined,
-    undefined,
-    true
+    {
+      debugPrerender: NextBuildContext.debugPrerender,
+      reactProductionProfiling: NextBuildContext.reactProductionProfiling,
+      bundler: process.env.NEXT_RSPACK ? Bundler.Rspack : Bundler.Webpack,
+    }
+  ))
+  await installBindings(config.experimental?.useWasmBinary)
+  NextBuildContext.nextBuildSpan = trace(
+    `worker-main-${workerData.compilerName}`
   )
-  NextBuildContext.nextBuildSpan = trace('next-build')
 
   const result = await webpackBuildImpl(workerData.compilerName)
-  const { entriesTrace } = result.turbotraceContext ?? {}
+  const { entriesTrace, chunksTrace } = result.buildTraceContext ?? {}
   if (entriesTrace) {
     const { entryNameMap, depModArray } = entriesTrace
     if (depModArray) {
-      result.turbotraceContext!.entriesTrace!.depModArray = depModArray
+      result.buildTraceContext!.entriesTrace!.depModArray = depModArray
     }
     if (entryNameMap) {
-      const entryEntries = Array.from(entryNameMap?.entries() ?? [])
-      // @ts-expect-error
-      result.turbotraceContext.entriesTrace.entryNameMap = entryEntries
+      const entryEntries = entryNameMap
+      result.buildTraceContext!.entriesTrace!.entryNameMap = entryEntries
     }
   }
-  return result
+  if (chunksTrace?.entryNameFilesMap) {
+    const entryNameFilesMap = chunksTrace.entryNameFilesMap
+    result.buildTraceContext!.chunksTrace!.entryNameFilesMap = entryNameFilesMap
+  }
+  NextBuildContext.nextBuildSpan.stop()
+  await telemetry.flush()
+
+  // Save CPU profile before worker exits
+  await saveCpuProfile()
+
+  return { ...result, debugTraceEvents: getTraceEvents() }
 }

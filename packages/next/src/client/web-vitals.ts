@@ -1,23 +1,21 @@
 import { useEffect } from 'react'
 import {
   onLCP,
-  onFID,
   onCLS,
   onINP,
   onFCP,
   onTTFB,
-  Metric,
 } from 'next/dist/compiled/web-vitals'
+import type { Metric } from 'next/dist/compiled/web-vitals'
 
 export function useReportWebVitals(
   reportWebVitalsFn: (metric: Metric) => void
 ) {
   useEffect(() => {
-    onCLS(reportWebVitalsFn)
-    onFID(reportWebVitalsFn)
-    onLCP(reportWebVitalsFn)
-    onINP(reportWebVitalsFn)
-    onFCP(reportWebVitalsFn)
+    onCLS(reportWebVitalsFn, { reportSoftNavs: true })
+    onLCP(reportWebVitalsFn, { reportSoftNavs: true })
+    onINP(reportWebVitalsFn, { reportSoftNavs: true })
+    onFCP(reportWebVitalsFn, { reportSoftNavs: true })
     onTTFB(reportWebVitalsFn)
   }, [reportWebVitalsFn])
 }

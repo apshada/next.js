@@ -1,63 +1,43 @@
-import {
-  ClientCSSReferenceManifest,
-  ClientReferenceManifest,
-} from '../../build/webpack/plugins/flight-manifest-plugin'
-import { getClientReferenceModuleKey } from '../../lib/client-reference'
+import type { CssResource } from '../../build/webpack/plugins/flight-manifest-plugin'
+import { getClientReferenceManifest } from './manifests-singleton'
 
 /**
  * Get external stylesheet link hrefs based on server CSS manifest.
  */
-export function getCssInlinedLinkTags(
-  clientReferenceManifest: ClientReferenceManifest,
-  serverCSSManifest: ClientCSSReferenceManifest,
+export function getLinkAndScriptTags(
   filePath: string,
-  serverCSSForEntries: string[],
   injectedCSS: Set<string>,
-  collectNewCSSImports?: boolean
-): string[] {
-  const layoutOrPageCssModules = serverCSSManifest.cssImports[filePath]
+  injectedScripts: Set<string>,
+  collectNewImports?: boolean
+): { styles: ReadonlySet<CssResource>; scripts: ReadonlySet<string> } {
+  const filePathWithoutExt = filePath.replace(/\.[^.]+$/, '')
+  const cssChunks = new Set<CssResource>()
+  const jsChunks = new Set<string>()
+  const { entryCSSFiles, entryJSFiles } = getClientReferenceManifest()
+  const cssFiles = entryCSSFiles[filePathWithoutExt]
+  const jsFiles = entryJSFiles?.[filePathWithoutExt]
 
-  const filePathWithoutExt = filePath.replace(/(\.[A-Za-z0-9]+)+$/, '')
-  const cssFilesForEntry = new Set(
-    clientReferenceManifest.cssFiles?.[filePathWithoutExt] || []
-  )
-
-  if (!layoutOrPageCssModules || !cssFilesForEntry.size) {
-    return []
-  }
-  const chunks = new Set<string>()
-
-  for (const mod of layoutOrPageCssModules) {
-    // We only include the CSS if it's a global CSS, or it is used by this
-    // entrypoint.
-    if (
-      serverCSSForEntries.includes(mod) ||
-      !/\.module\.(css|sass|scss)$/.test(mod)
-    ) {
-      // If the CSS is already injected by a parent layer, we don't need
-      // to inject it again.
-      if (!injectedCSS.has(mod)) {
-        const modData =
-          clientReferenceManifest.clientModules[
-            getClientReferenceModuleKey(mod, '')
-          ]
-        if (modData) {
-          for (const chunk of modData.chunks) {
-            // If the current entry in the final tree-shaked bundle has that CSS
-            // chunk, it means that it's actually used. We should include it.
-            if (cssFilesForEntry.has(chunk)) {
-              chunks.add(chunk)
-              // This might be a new layout, and to make it more efficient and
-              // not introducing another loop, we mutate the set directly.
-              if (collectNewCSSImports) {
-                injectedCSS.add(mod)
-              }
-            }
-          }
+  if (cssFiles) {
+    for (const css of cssFiles) {
+      if (!injectedCSS.has(css.path)) {
+        if (collectNewImports) {
+          injectedCSS.add(css.path)
         }
+        cssChunks.add(css)
       }
     }
   }
 
-  return [...chunks]
+  if (jsFiles) {
+    for (const file of jsFiles) {
+      if (!injectedScripts.has(file)) {
+        if (collectNewImports) {
+          injectedScripts.add(file)
+        }
+        jsChunks.add(file)
+      }
+    }
+  }
+
+  return { styles: cssChunks, scripts: jsChunks }
 }

@@ -1,134 +1,444 @@
+import type { IncrementalCache } from '../../lib/incremental-cache'
+
+import { CACHE_ONE_YEAR_SECONDS } from '../../../lib/constants'
+import { validateRevalidate, validateTags } from '../../lib/patch-fetch'
+import { encodeHeaderSafe } from '../../lib/encode-header-safe'
 import {
-  StaticGenerationAsyncStorage,
-  StaticGenerationStore,
-} from '../../../client/components/static-generation-async-storage'
+  workAsyncStorage,
+  type WorkStore,
+} from '../../app-render/work-async-storage.external'
+import {
+  getCacheSignal,
+  getDraftModeProviderForCacheScope,
+  willConsumerServerCache,
+  workUnitAsyncStorage,
+} from '../../app-render/work-unit-async-storage.external'
+import {
+  CachedRouteKind,
+  IncrementalCacheKind,
+  type CachedFetchData,
+} from '../../response-cache'
+import type {
+  UnstableCacheStore,
+  WorkUnitStore,
+} from '../../app-render/work-unit-async-storage.external'
 
 type Callback = (...args: any[]) => Promise<any>
 
-// TODO: generic callback type?
-export function unstable_cache(
-  cb: Callback,
-  keyParts: string[],
+let noStoreFetchIdx = 0
+
+async function cacheNewResult<T>(
+  result: T,
+  incrementalCache: IncrementalCache,
+  cacheKey: string,
+  tags: string[],
+  revalidate: number | false | undefined,
+  fetchIdx: number,
+  fetchUrl: string
+): Promise<unknown> {
+  await incrementalCache.set(
+    cacheKey,
+    {
+      kind: CachedRouteKind.FETCH,
+      data: {
+        headers: {},
+        // TODO: handle non-JSON values?
+        body: JSON.stringify(result),
+        status: 200,
+        url: '',
+      } satisfies CachedFetchData,
+      revalidate:
+        typeof revalidate !== 'number' ? CACHE_ONE_YEAR_SECONDS : revalidate,
+    },
+    { fetchCache: true, tags, fetchIdx, fetchUrl }
+  )
+  return
+}
+
+/**
+ * This function allows you to cache the results of expensive operations, like database queries, and reuse them across multiple requests.
+ *
+ * Read more: [Next.js Docs: `unstable_cache`](https://nextjs.org/docs/app/api-reference/functions/unstable_cache)
+ */
+export function unstable_cache<T extends Callback>(
+  cb: T,
+  keyParts?: string[],
   options: {
-    revalidate: number | false
+    /**
+     * The revalidation interval in seconds.
+     */
+    revalidate?: number | false
     tags?: string[]
-  }
-): Callback {
-  const joinedKey = cb.toString() + '-' + keyParts.join(', ')
-  const staticGenerationAsyncStorage = (
-    fetch as any
-  ).__nextGetStaticStore?.() as undefined | StaticGenerationAsyncStorage
-
-  const store: undefined | StaticGenerationStore =
-    staticGenerationAsyncStorage?.getStore()
-
-  if (!store || !store.incrementalCache) {
-    throw new Error(
-      `Invariant: static generation store missing in unstable_cache ${joinedKey}`
-    )
-  }
-
+  } = {}
+): T {
   if (options.revalidate === 0) {
     throw new Error(
-      `Invariant revalidate: 0 can not be passed to unstable_cache(), must be "false" or "> 0" ${joinedKey}`
+      `Invariant revalidate: 0 can not be passed to unstable_cache(), must be "false" or "> 0" ${cb.toString()}`
     )
   }
 
-  return async (...args: any[]) => {
-    // We override the default fetch cache handling inside of the
-    // cache callback so that we only cache the specific values returned
-    // from the callback instead of also caching any fetches done inside
-    // of the callback as well
-    return staticGenerationAsyncStorage?.run(
-      {
-        ...store,
-        fetchCache: 'only-no-store',
-      },
-      async () => {
-        const cacheKey = await store.incrementalCache?.fetchCacheKey(joinedKey)
-        const cacheEntry =
-          cacheKey &&
-          !store.isOnDemandRevalidate &&
-          (await store.incrementalCache?.get(
-            cacheKey,
-            true,
-            options.revalidate as number
-          ))
+  // Validate the tags provided are valid
+  const tags = options.tags
+    ? validateTags(options.tags, `unstable_cache ${cb.toString()}`)
+    : []
 
-        const invokeCallback = async () => {
-          const result = await cb(...args)
+  // Validate the revalidate option, and adopt the normalized value, which
+  // maps `false` and `Infinity` to INFINITE_CACHE so that the stored value
+  // survives JSON serialization.
+  const revalidate = validateRevalidate(
+    options.revalidate,
+    `unstable_cache ${cb.name || cb.toString()}`
+  )
 
-          if (cacheKey && store.incrementalCache) {
-            await store.incrementalCache.set(
-              cacheKey,
-              {
-                kind: 'FETCH',
-                data: {
-                  headers: {},
-                  // TODO: handle non-JSON values?
-                  body: JSON.stringify(result),
-                  status: 200,
-                  tags: options.tags,
-                },
-                revalidate: options.revalidate as number,
-              },
-              options.revalidate,
-              true
-            )
+  // Stash the fixed part of the key at construction time. The invocation key will combine
+  // the fixed key with the arguments when actually called
+  // @TODO if cb.toString() is long we should hash it
+  // @TODO come up with a collision-free way to combine keyParts
+  // @TODO consider validating the keyParts are all strings. TS can't provide runtime guarantees
+  // and the error produced by accidentally using something that cannot be safely coerced is likely
+  // hard to debug
+  const fixedKey = `${cb.toString()}-${
+    Array.isArray(keyParts) && keyParts.join(',')
+  }`
+
+  const cachedCb = async (...args: any[]) => {
+    const workStore = workAsyncStorage.getStore()
+    const workUnitStore = workUnitAsyncStorage.getStore()
+
+    // We must be able to find the incremental cache otherwise we throw
+    const maybeIncrementalCache:
+      | import('../../lib/incremental-cache').IncrementalCache
+      | undefined =
+      workStore?.incrementalCache || (globalThis as any).__incrementalCache
+
+    if (!maybeIncrementalCache) {
+      throw new Error(
+        `Invariant: incrementalCache missing in unstable_cache ${cb.toString()}`
+      )
+    }
+    const incrementalCache = maybeIncrementalCache
+
+    const cacheSignal = workUnitStore ? getCacheSignal(workUnitStore) : null
+    if (cacheSignal) {
+      cacheSignal.beginRead()
+    }
+    try {
+      // If there's no request store, we aren't in a request (or we're not in
+      // app router) and if there's no static generation store, we aren't in app
+      // router. Default to an empty pathname and search params when there's no
+      // request store or static generation store available.
+      const fetchUrlPrefix =
+        workStore && workUnitStore
+          ? getFetchUrlPrefix(workStore, workUnitStore)
+          : ''
+
+      // Construct the complete cache key for this function invocation
+      // @TODO stringify is likely not safe here. We will coerce undefined to null which will make
+      // the keyspace smaller than the execution space
+      const invocationKey = `${fixedKey}-${JSON.stringify(args)}`
+      const cacheKey =
+        await incrementalCache.generateSimpleCacheKey(invocationKey)
+      // $urlWithPath,$sortedQueryStringKeys,$hashOfEveryThingElse
+      //
+      // A cache implementation may serialize this name into an HTTP request
+      // header, so it is encoded here. Both parts can carry a character above
+      // U+00FF: the search parameters are decoded, and a JavaScript identifier
+      // may hold one. The character class leaves the separating spaces and the
+      // URL punctuation untouched, so the shape above is preserved.
+      //
+      // `toWellFormed` replaces lone surrogates, which `cb.name` can hold and
+      // which `encodeURIComponent` rejects. The name identifies the call for
+      // debug metrics, so a replacement character is an acceptable trade for
+      // not failing the render.
+      const fetchUrl = encodeHeaderSafe(
+        `unstable_cache ${fetchUrlPrefix} ${cb.name ? ` ${cb.name}` : cacheKey}`.toWellFormed()
+      )
+      const fetchIdx =
+        (workStore ? workStore.nextFetchId : noStoreFetchIdx) ?? 1
+
+      const implicitTags = workUnitStore?.implicitTags
+
+      const innerCacheStore: UnstableCacheStore = {
+        type: 'unstable-cache',
+        phase: 'render',
+        consumerWillServerCache: true,
+        implicitTags,
+        draftMode:
+          workUnitStore &&
+          workStore &&
+          getDraftModeProviderForCacheScope(workStore, workUnitStore),
+        rootParams: undefined,
+      }
+
+      if (workStore) {
+        workStore.nextFetchId = fetchIdx + 1
+
+        // We are in an App Router context. We try to return the cached entry if it exists and is valid
+        // If the entry is fresh we return it. If the entry is stale we return it but revalidate the entry in
+        // the background. If the entry is missing or invalid we generate a new entry and return it.
+
+        let isNestedUnstableCache = false
+
+        if (workUnitStore) {
+          switch (workUnitStore.type) {
+            case 'cache':
+            case 'private-cache':
+            case 'prerender':
+            case 'prerender-runtime':
+            case 'prerender-legacy':
+              // We update the store's revalidate property if the revalidate option is a higher precedence
+              // revalidate === undefined doesn't affect timing.
+              // revalidate === INFINITE_CACHE (from `false` or `Infinity`) doesn't shrink timing. it stays at the maximum.
+              if (typeof revalidate === 'number') {
+                if (workUnitStore.revalidate < revalidate) {
+                  // The store is already revalidating on a shorter time interval, leave it alone
+                } else {
+                  workUnitStore.revalidate = revalidate
+                }
+              }
+
+              // We need to accumulate the tags for this invocation within the store
+              const collectedTags = workUnitStore.tags
+              if (collectedTags === null) {
+                workUnitStore.tags = tags.slice()
+              } else {
+                for (const tag of tags) {
+                  // @TODO refactor tags to be a set to avoid this O(n) lookup
+                  if (!collectedTags.includes(tag)) {
+                    collectedTags.push(tag)
+                  }
+                }
+              }
+              break
+            case 'unstable-cache':
+              isNestedUnstableCache = true
+              break
+            case 'prerender-client':
+            case 'validation-client':
+            case 'request':
+            case 'build-time-generator':
+              break
+            default:
+              workUnitStore satisfies never
           }
-          return result
         }
 
-        if (!cacheEntry || !cacheEntry.value) {
-          return invokeCallback()
-        }
-
-        if (cacheEntry.value.kind !== 'FETCH') {
-          console.error(
-            `Invariant invalid cacheEntry returned for ${joinedKey}`
-          )
-          return invokeCallback()
-        }
-        let cachedValue: any
-        const isStale = cacheEntry.isStale
-
-        if (cacheEntry) {
-          const resData = cacheEntry.value.data
-          cachedValue = JSON.parse(resData.body)
-        }
-        const currentTags = cacheEntry.value.data.tags
-
-        if (isStale) {
-          if (!store.pendingRevalidates) {
-            store.pendingRevalidates = []
-          }
-          store.pendingRevalidates.push(
-            invokeCallback().catch((err) =>
-              console.error(`revalidating cache with key: ${joinedKey}`, err)
-            )
-          )
-        } else if (
-          options.tags &&
-          !options.tags.every((tag) => currentTags?.includes(tag))
+        if (
+          // when we are nested inside of other unstable_cache's
+          // we should bypass cache similar to fetches
+          !isNestedUnstableCache &&
+          workStore.fetchCache !== 'force-no-store' &&
+          !workStore.isDraftMode
         ) {
-          if (!cacheEntry.value.data.tags) {
-            cacheEntry.value.data.tags = []
-          }
+          // We attempt to get the current cache entry from the incremental cache.
+          const cacheEntry = await incrementalCache.get(cacheKey, {
+            kind: IncrementalCacheKind.FETCH,
+            revalidate,
+            tags,
+            softTags: implicitTags?.tags,
+            fetchIdx,
+            fetchUrl,
+          })
 
-          for (const tag of options.tags) {
-            if (!cacheEntry.value.data.tags.includes(tag)) {
-              cacheEntry.value.data.tags.push(tag)
+          if (cacheEntry && cacheEntry.value) {
+            // The entry exists and has a value
+            if (cacheEntry.value.kind !== CachedRouteKind.FETCH) {
+              // The entry is invalid and we need a special warning
+              // @TODO why do we warn this way? Should this just be an error? How are these errors surfaced
+              // so bugs can be reported
+              // @TODO the invocation key can have sensitive data in it. we should not log this entire object
+              console.error(
+                `Invariant invalid cacheEntry returned for ${invocationKey}`
+              )
+              // will fall through to generating a new cache entry below
+            } else {
+              // We have a valid cache entry so we will be returning it. We also check to see if we need
+              // to background revalidate it by checking if it is stale.
+              const cachedResponse =
+                cacheEntry.value.data.body !== undefined
+                  ? JSON.parse(cacheEntry.value.data.body)
+                  : undefined
+
+              if (cacheEntry.isStale) {
+                if (!workStore.pendingRevalidates) {
+                  workStore.pendingRevalidates = {}
+                }
+
+                // Check if there's already a pending revalidation to avoid duplicate work
+                if (!workStore.pendingRevalidates[invocationKey]) {
+                  // Create the revalidation promise
+                  const revalidationPromise = workUnitAsyncStorage
+                    .run(innerCacheStore, cb, ...args)
+                    .then(async (result) => {
+                      await cacheNewResult(
+                        result,
+                        incrementalCache,
+                        cacheKey,
+                        tags,
+                        revalidate,
+                        fetchIdx,
+                        fetchUrl
+                      )
+                      return result
+                    })
+                    .catch((err) => {
+                      // @TODO This error handling seems wrong. We swallow the error?
+                      console.error(
+                        `revalidating cache with key: ${invocationKey}`,
+                        err
+                      )
+                      // Return the stale value on error for foreground revalidation
+                      return cachedResponse
+                    })
+
+                  // Attach the empty catch here so we don't get a "unhandled promise
+                  // rejection" warning. (Behavior is matched with patch-fetch)
+                  if (willConsumerServerCache(workUnitStore)) {
+                    revalidationPromise.catch(() => {})
+                  }
+
+                  workStore.pendingRevalidates[invocationKey] =
+                    revalidationPromise
+                }
+
+                // Check if we need to do foreground revalidation
+                if (willConsumerServerCache(workUnitStore)) {
+                  // When the consumer will persist this result in a server
+                  // cache, wait for fresh data so it doesn't persist a stale
+                  // value. The `await` here also keeps `cacheSignal.endRead` (in
+                  // the outer `finally`) suspended until the recompute +
+                  // cacheNewResult actually complete, so a prospective
+                  // prerender's `cacheSignal` doesn't resolve `cacheReady`
+                  // prematurely.
+                  return await workStore.pendingRevalidates[invocationKey]
+                }
+                // Otherwise, we're doing background revalidation - return stale immediately
+              }
+
+              // We had a valid cache entry so we return it here
+              return cachedResponse
             }
           }
-          store.incrementalCache?.set(
+        }
+
+        // If we got this far then we had an invalid cache entry and need to generate a new one
+        const result = await workUnitAsyncStorage.run(
+          innerCacheStore,
+          cb,
+          ...args
+        )
+
+        if (!workStore.isDraftMode) {
+          if (!workStore.pendingRevalidates) {
+            workStore.pendingRevalidates = {}
+          }
+
+          // We need to push the cache result promise to pending
+          // revalidates otherwise it won't be awaited and is just
+          // dangling
+          workStore.pendingRevalidates[invocationKey] = cacheNewResult(
+            result,
+            incrementalCache,
             cacheKey,
-            cacheEntry.value,
-            options.revalidate,
-            true
+            tags,
+            revalidate,
+            fetchIdx,
+            fetchUrl
           )
         }
-        return cachedValue
+
+        return result
+      } else {
+        noStoreFetchIdx += 1
+        // We are in Pages Router or were called outside of a render. We don't have a store
+        // so we just call the callback directly when it needs to run.
+        // If the entry is fresh we return it. If the entry is stale we return it but revalidate the entry in
+        // the background. If the entry is missing or invalid we generate a new entry and return it.
+
+        const cacheEntry = await incrementalCache.get(cacheKey, {
+          kind: IncrementalCacheKind.FETCH,
+          revalidate,
+          tags,
+          fetchIdx,
+          fetchUrl,
+          softTags: implicitTags?.tags,
+        })
+
+        if (cacheEntry && cacheEntry.value) {
+          // The entry exists and has a value
+          if (cacheEntry.value.kind !== CachedRouteKind.FETCH) {
+            // The entry is invalid and we need a special warning
+            // @TODO why do we warn this way? Should this just be an error? How are these errors surfaced
+            // so bugs can be reported
+            console.error(
+              `Invariant invalid cacheEntry returned for ${invocationKey}`
+            )
+            // will fall through to generating a new cache entry below
+          } else if (!cacheEntry.isStale) {
+            // We have a valid cache entry and it is fresh so we return it
+            return cacheEntry.value.data.body !== undefined
+              ? JSON.parse(cacheEntry.value.data.body)
+              : undefined
+          }
+        }
+
+        // If we got this far then we had an invalid cache entry and need to generate a new one
+        const result = await workUnitAsyncStorage.run(
+          innerCacheStore,
+          cb,
+          ...args
+        )
+
+        // we need to wait setting the new cache result here as
+        // we don't have pending revalidates on workStore to
+        // push to and we can't have a dangling promise
+        await cacheNewResult(
+          result,
+          incrementalCache,
+          cacheKey,
+          tags,
+          revalidate,
+          fetchIdx,
+          fetchUrl
+        )
+        return result
       }
-    )
+    } finally {
+      if (cacheSignal) {
+        cacheSignal.endRead()
+      }
+    }
+  }
+  // TODO: once AsyncLocalStorage.run() returns the correct types this override will no longer be necessary
+  return cachedCb as unknown as T
+}
+
+function getFetchUrlPrefix(
+  workStore: WorkStore,
+  workUnitStore: WorkUnitStore
+): string {
+  switch (workUnitStore.type) {
+    case 'request':
+      const pathname = workUnitStore.url.pathname
+      const searchParams = new URLSearchParams(workUnitStore.url.search)
+
+      const sortedSearch = [...searchParams.keys()]
+        .sort((a, b) => a.localeCompare(b))
+        .map((key) => `${key}=${searchParams.get(key)}`)
+        .join('&')
+
+      return `${pathname}${sortedSearch.length ? '?' : ''}${sortedSearch}`
+    case 'prerender':
+    case 'prerender-client':
+    case 'validation-client':
+    case 'prerender-runtime':
+    case 'prerender-legacy':
+    case 'cache':
+    case 'private-cache':
+    case 'unstable-cache':
+    case 'build-time-generator':
+      return workStore.route
+    default:
+      return workUnitStore satisfies never
   }
 }

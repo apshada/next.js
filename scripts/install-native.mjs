@@ -1,79 +1,134 @@
 import os from 'os'
 import path from 'path'
 import execa from 'execa'
-import fs from 'fs-extra'
+import fs from 'fs'
+import fsp from 'fs/promises'
+import { outdent } from 'outdent'
 ;(async function () {
-  if (process.env.NEXT_SKIP_NATIVE_POSTINSTALL) {
+  // Automatically installing native bindings is opt-in in CI and opt-out in local development.
+  // Most CI jobs use native bindings built from the commit they run on anyway.
+  const rawSkip = process.env.NEXT_SKIP_NATIVE_POSTINSTALL
+  const skipNativePostinstall =
+    rawSkip == null || rawSkip === ''
+      ? process.env.CI === 'true'
+      : rawSkip !== '0' && rawSkip !== 'false'
+
+  if (skipNativePostinstall) {
     console.log(
-      `Skipping next-swc postinstall due to NEXT_SKIP_NATIVE_POSTINSTALL env`
+      `Skipping next-swc postinstall (NEXT_SKIP_NATIVE_POSTINSTALL=${String(JSON.stringify(rawSkip))}, CI=${String(JSON.stringify(process.env.CI))})`
     )
     return
   }
+
+  const preferOffline = process.env.NEXT_TEST_PREFER_OFFLINE === '1'
+
   let cwd = process.cwd()
-  const { version: nextVersion } = await fs.readJSON(
-    path.join(cwd, 'packages', 'next', 'package.json')
+  const { version: nextVersion } = JSON.parse(
+    fs.readFileSync(path.join(cwd, 'packages', 'next', 'package.json'))
+  )
+  const { packageManager } = JSON.parse(
+    fs.readFileSync(path.join(cwd, 'package.json'))
   )
 
   try {
     // if installed swc package version matches monorepo version
     // we can skip re-installing
-    for (const pkg of await fs.readdir(
-      path.join(cwd, 'node_modules', '@next')
-    )) {
+    for (const pkg of fs.readdirSync(path.join(cwd, 'node_modules', '@next'))) {
       if (
         pkg.startsWith('swc-') &&
-        (
-          await fs.readJSON(
+        JSON.parse(
+          fs.readFileSync(
             path.join(cwd, 'node_modules', '@next', pkg, 'package.json')
           )
         ).version === nextVersion
       ) {
-        console.log(`@next/${pkg}@${nextVersion} already installed skipping`)
+        console.log(`@next/${pkg}@${nextVersion} already installed, skipping`)
         return
       }
     }
-  } catch (_) {}
+  } catch {}
 
   try {
     let tmpdir = path.join(os.tmpdir(), `next-swc-${Date.now()}`)
-    await fs.ensureDir(tmpdir)
+    fs.mkdirSync(tmpdir, { recursive: true })
     let pkgJson = {
       name: 'dummy-package',
       version: '1.0.0',
       optionalDependencies: {
-        '@next/swc-darwin-arm64': 'canary',
-        '@next/swc-darwin-x64': 'canary',
-        '@next/swc-linux-arm64-gnu': 'canary',
-        '@next/swc-linux-arm64-musl': 'canary',
-        '@next/swc-linux-x64-gnu': 'canary',
-        '@next/swc-linux-x64-musl': 'canary',
-        '@next/swc-win32-arm64-msvc': 'canary',
-        '@next/swc-win32-ia32-msvc': 'canary',
-        '@next/swc-win32-x64-msvc': 'canary',
+        '@next/swc-darwin-arm64': nextVersion,
+        '@next/swc-darwin-x64': nextVersion,
+        '@next/swc-linux-arm64-gnu': nextVersion,
+        '@next/swc-linux-arm64-musl': nextVersion,
+        '@next/swc-linux-x64-gnu': nextVersion,
+        '@next/swc-linux-x64-musl': nextVersion,
+        '@next/swc-win32-arm64-msvc': nextVersion,
+        '@next/swc-win32-x64-msvc': nextVersion,
       },
+      packageManager,
     }
-    await fs.writeFile(
-      path.join(tmpdir, 'package.json'),
-      JSON.stringify(pkgJson)
+    fs.writeFileSync(path.join(tmpdir, 'package.json'), JSON.stringify(pkgJson))
+    fs.writeFileSync(
+      path.join(tmpdir, 'pnpm-workspace.yaml'),
+      '' +
+        outdent`
+          nodeLinker: hoisted
+        ` +
+        '\n' +
+        // Propagate security related settings from file://./../../pnpm-workspace.yaml
+        outdent`
+          blockExoticSubdeps: true
+          minimumReleaseAge: 2880 # 48 hrs
+          minimumReleaseAgeExclude:
+            - '@next/*'
+            - '@turbo/*'
+            - '@vercel/*'
+            - '@workflow/*'
+            - babel-plugin-react-compiler
+            - next
+            - react
+            - react-dom
+            - react-is
+            - react-server-dom-*
+            - scheduler
+            - turbo
+        `
     )
-    let { stdout } = await execa('yarn', ['--force'], { cwd: tmpdir })
-    console.log(stdout)
-    let pkgs = await fs.readdir(path.join(tmpdir, 'node_modules/@next'))
-    await fs.ensureDir(path.join(cwd, 'node_modules/@next'))
+
+    const args = ['install', '--lockfile=false', '--ignore-scripts']
+    if (preferOffline) {
+      args.push('--prefer-offline')
+    }
+    await execa('pnpm', args, { cwd: tmpdir })
+
+    /** @type {string[]} */
+    let pkgs
+    try {
+      pkgs = fs.readdirSync(path.join(tmpdir, 'node_modules/@next'), {})
+    } catch (error) {
+      throw new Error(
+        'No binary candidate found.\n' +
+          `This environment is not supported by Next.js or publish of ${nextVersion} is incomplete.\n` +
+          'If binaries are built from source, set `NEXT_SKIP_NATIVE_POSTINSTALL=1`.',
+        { cause: error }
+      )
+    }
+    fs.mkdirSync(path.join(cwd, 'node_modules/@next'), { recursive: true })
 
     await Promise.all(
-      pkgs.map((pkg) =>
-        fs.move(
-          path.join(tmpdir, 'node_modules/@next', pkg),
-          path.join(cwd, 'node_modules/@next', pkg),
-          { overwrite: true }
-        )
-      )
+      pkgs.map(async (pkg) => {
+        const from = path.join(tmpdir, 'node_modules/@next', pkg)
+        const to = path.join(cwd, 'node_modules/@next', pkg)
+        // The directory from pnpm store is a symlink, which can not be overwritten,
+        // so we remove the existing directory before copying
+        await fsp.rm(to, { recursive: true, force: true })
+        // Renaming is flaky on Windows, and the tmpdir is going to be deleted anyway,
+        // so we use copy the directory instead
+        return fsp.cp(from, to, { force: true, recursive: true })
+      })
     )
-    await fs.remove(tmpdir)
+    fs.rmSync(tmpdir, { recursive: true, force: true })
     console.log('Installed the following binary packages:', pkgs)
   } catch (e) {
-    console.error(e)
-    console.error('Failed to load @next/swc binary packages')
+    throw new Error('Failed to install @next/swc binary packages', { cause: e })
   }
 })()

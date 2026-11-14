@@ -1,53 +1,49 @@
-import { createNext } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { nextTestSetup, isNextDev } from 'e2e-utils'
 import { fetchViaHTTP } from 'next-test-utils'
 
+// Deploy mode exclusion: This suite manually creates a package in the local `node_modules` directory.
+// @force-gate !deploy
 describe('Edge compiler module exports preference', () => {
-  let next: NextInstance
+  const { next } = nextTestSetup({
+    files: {
+      'pages/index.js': `
+        export default function Page() {
+          return <p>hello world</p>
+        }
+      `,
+      'middleware.js': `
+        import { NextResponse } from 'next/server';
+        import lib from 'my-lib';
 
-  beforeAll(async () => {
-    next = await createNext({
-      files: {
-        'pages/index.js': `
-          export default function Page() {
-            return <p>hello world</p>
-          }
-        `,
-        'middleware.js': `
-          import { NextResponse } from 'next/server';
-          import lib from 'my-lib';
-
-          export default (req) => {
-            return NextResponse.next({
-              headers: {
-                'x-imported': lib
-              }
-            })
-          }
-        `,
-        'my-lib/package.json': JSON.stringify({
-          name: 'my-lib',
-          version: '1.0.0',
-          main: 'index.js',
-          browser: 'browser.js',
-        }),
-        'my-lib/index.js': `module.exports = "Node.js"`,
-        'my-lib/browser.js': `module.exports = "Browser"`,
+        export default (req) => {
+          return NextResponse.next({
+            headers: {
+              'x-imported': lib
+            }
+          })
+        }
+      `,
+      'node_modules/my-lib/package.json': JSON.stringify({
+        name: 'my-lib',
+        version: '1.0.0',
+        main: 'index.js',
+        browser: 'browser.js',
+      }),
+      'node_modules/my-lib/index.js': `module.exports = "Node.js"`,
+      'node_modules/my-lib/browser.js': `module.exports = "Browser"`,
+    },
+    packageJson: {
+      scripts: {
+        build: 'next build',
+        dev: 'next dev',
+        start: 'next start',
       },
-      packageJson: {
-        scripts: {
-          setup: `cp -r ./my-lib ./node_modules`,
-          build: 'yarn setup && next build',
-          dev: 'yarn setup && next dev',
-          start: 'next start',
-        },
-      },
-      startCommand: (global as any).isNextDev ? 'yarn dev' : 'yarn start',
-      buildCommand: 'yarn build',
-      dependencies: {},
-    })
+    },
+    installCommand: 'pnpm i',
+    startCommand: isNextDev ? 'pnpm dev' : 'pnpm start',
+    buildCommand: 'pnpm run build',
+    dependencies: {},
   })
-  afterAll(() => next.destroy())
 
   it('favors the browser export', async () => {
     const response = await fetchViaHTTP(next.url, '/')

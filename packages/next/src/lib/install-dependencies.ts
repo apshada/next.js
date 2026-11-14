@@ -1,7 +1,7 @@
-import chalk from 'next/dist/compiled/chalk'
+import { cyan } from './picocolors'
 import path from 'path'
 
-import { MissingDependency } from './has-necessary-dependencies'
+import type { MissingDependency } from './has-necessary-dependencies'
 import { getPkgManager } from './helpers/get-pkg-manager'
 import { install } from './helpers/install'
 import { getOnline } from './helpers/get-online'
@@ -26,13 +26,13 @@ export async function installDependencies(
       } (${packageManager}):`
     )
     for (const dep of deps) {
-      console.log(`- ${chalk.cyan(dep.pkg)}`)
+      console.log(`- ${cyan(dep.pkg)}`)
     }
     console.log()
 
     await install(
       path.resolve(baseDir),
-      deps.map((dep: MissingDependency) => dep.pkg),
+      deps.map((dep: MissingDependency) => dep.install ?? dep.pkg),
       { devDependencies: dev, isOnline, packageManager }
     )
     console.log()

@@ -1,8 +1,10 @@
-/// <reference types="node" />
-import type { ReactElement } from 'react';
-import type { ImageResponseNodeOptions, ImageResponseOptions } from './types';
+import { ReactElement } from 'react';
+import { ImageResponseOptions, ImageResponseNodeOptions } from './types.js';
 import { Readable } from 'stream';
-export declare class ImageResponse {
+import "next/dist/compiled/@vercel/og/satori";
+import 'http';
+
+declare class ImageResponse extends Response {
     constructor(element: ReactElement, options?: ImageResponseOptions);
 }
 /**
@@ -22,4 +24,7 @@ export declare class ImageResponse {
  * }
  * ```
  */
-export declare function unstable_createNodejsStream(element: ReactElement, options?: Omit<ImageResponseNodeOptions, 'status' | 'statusText' | 'headers'>): Promise<Readable>;
+declare function unstable_createNodejsStream(element: ReactElement, options?: Omit<ImageResponseNodeOptions, 'status' | 'statusText' | 'headers'>): Promise<Readable>;
+type NodeImageResponse = typeof ImageResponse;
+
+export { ImageResponse, ImageResponseOptions, NodeImageResponse, unstable_createNodejsStream };

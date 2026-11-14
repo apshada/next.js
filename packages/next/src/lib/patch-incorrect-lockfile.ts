@@ -1,17 +1,16 @@
-import { promises } from 'fs'
-import '../server/node-polyfill-fetch'
+import { readFileSync, writeFileSync } from 'fs'
 import * as Log from '../build/output/log'
 import findUp from 'next/dist/compiled/find-up'
 // @ts-ignore no-json types
-import nextPkgJson from 'next/package.json'
+import { optionalDependencies as nextOptionalDeps } from 'next/package.json'
 import type { UnwrapPromise } from './coalesced-function'
-import { isCI } from '../telemetry/ci-info'
+import { isCI } from '../server/ci-info'
 import { getRegistry } from './helpers/get-registry'
 
 let registry: string | undefined
 
 async function fetchPkgInfo(pkg: string) {
-  if (!registry) registry = getRegistry()
+  if (!registry) registry = await getRegistry()
   const res = await fetch(`${registry}${pkg}`)
 
   if (!res.ok) {
@@ -20,7 +19,7 @@ async function fetchPkgInfo(pkg: string) {
     )
   }
   const data = await res.json()
-  const versionData = data.versions[nextPkgJson.version]
+  const versionData = data.versions[process.env.__NEXT_VERSION as string]
 
   return {
     os: versionData.os,
@@ -47,24 +46,26 @@ export async function patchIncorrectLockfile(dir: string) {
     // if no lockfile present there is no action to take
     return
   }
-  const content = await promises.readFile(lockfilePath, 'utf8')
+  const content = readFileSync(lockfilePath, 'utf8')
   // maintain current line ending
   const endingNewline = content.endsWith('\r\n')
     ? '\r\n'
     : content.endsWith('\n')
-    ? '\n'
-    : ''
+      ? '\n'
+      : ''
 
   const lockfileParsed = JSON.parse(content)
   const lockfileVersion = parseInt(lockfileParsed?.lockfileVersion, 10)
-  const expectedSwcPkgs = Object.keys(nextPkgJson.optionalDependencies || {})
+  const expectedSwcPkgs = Object.keys(nextOptionalDeps || {}).filter((pkg) =>
+    pkg.startsWith('@next/swc-')
+  )
 
   const patchDependency = (
     pkg: string,
     pkgData: UnwrapPromise<ReturnType<typeof fetchPkgInfo>>
   ) => {
     lockfileParsed.dependencies[pkg] = {
-      version: nextPkgJson.version,
+      version: process.env.__NEXT_VERSION as string,
       resolved: pkgData.tarball,
       integrity: pkgData.integrity,
       optional: true,
@@ -76,7 +77,7 @@ export async function patchIncorrectLockfile(dir: string) {
     pkgData: UnwrapPromise<ReturnType<typeof fetchPkgInfo>>
   ) => {
     lockfileParsed.packages[pkg] = {
-      version: nextPkgJson.version,
+      version: process.env.__NEXT_VERSION as string,
       resolved: pkgData.tarball,
       integrity: pkgData.integrity,
       cpu: pkgData.cpu,
@@ -160,7 +161,7 @@ export async function patchIncorrectLockfile(dir: string) {
       }
     }
 
-    await promises.writeFile(
+    writeFileSync(
       lockfilePath,
       JSON.stringify(lockfileParsed, null, 2) + endingNewline
     )

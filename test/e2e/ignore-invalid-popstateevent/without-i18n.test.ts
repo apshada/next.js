@@ -1,13 +1,10 @@
 import { join } from 'path'
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { FileRef, nextTestSetup, type Playwright } from 'e2e-utils'
 import { check, waitFor } from 'next-test-utils'
-import webdriver from 'next-webdriver'
 
-import type { HistoryState } from '../../../packages/next/src/shared/lib/router/router'
-import { BrowserInterface } from 'test/lib/browsers/base'
+import type { HistoryState } from 'next/dist/shared/lib/router/router'
 
-const emitPopsStateEvent = (browser: BrowserInterface, state: HistoryState) =>
+const emitPopsStateEvent = (browser: Playwright, state: HistoryState) =>
   browser.eval(
     `window.dispatchEvent(new PopStateEvent("popstate", { state: ${JSON.stringify(
       state
@@ -15,22 +12,16 @@ const emitPopsStateEvent = (browser: BrowserInterface, state: HistoryState) =>
   )
 
 describe('Event with stale state - static route previously was dynamic', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    next = await createNext({
-      files: {
-        pages: new FileRef(join(__dirname, 'app/pages')),
-        // Don't use next.config.js to avoid getting i18n
-      },
-      dependencies: {},
-    })
+  const { next } = nextTestSetup({
+    files: {
+      pages: new FileRef(join(__dirname, 'app/pages')),
+      // Don't use next.config.js to avoid getting i18n
+    },
+    dependencies: {},
   })
-  afterAll(() => next.destroy())
 
   test('Ignore event without query param', async () => {
-    const browser = await webdriver(next.url, '/static')
-    browser.close()
+    const browser = await next.browser('/static')
 
     const state: HistoryState = {
       url: '/[dynamic]?',
@@ -53,7 +44,7 @@ describe('Event with stale state - static route previously was dynamic', () => {
   })
 
   test('Ignore event with query param', async () => {
-    const browser = await webdriver(next.url, '/static?param=1')
+    const browser = await next.browser('/static?param=1')
 
     const state: HistoryState = {
       url: '/[dynamic]?param=1',
